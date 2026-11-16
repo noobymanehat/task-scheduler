@@ -1,6 +1,6 @@
 # Design
 
-Status: **Phase 0 (scaffold) complete** (last updated 2026-11-16). Phases 1-6 in §10 are
+Status: **Phases 0-1 complete** (scaffold, submit API; last updated 2026-11-16). Phases 2-6 in §10 are
 designed but not built; this document is updated as each phase lands.
 
 Pinned versions: Java 21, Spring Boot 4.1.2, PostgreSQL 16 (`postgres:16-alpine` in both
@@ -91,6 +91,8 @@ CREATE INDEX jobs_running_idx ON jobs (locked_by) WHERE status = 'RUNNING';
 CREATE UNIQUE INDEX jobs_idempotency_idx ON jobs (idempotency_key) WHERE idempotency_key IS NOT NULL;
 -- DLQ listing.
 CREATE INDEX jobs_dead_idx ON jobs (finished_at DESC) WHERE status = 'DEAD';
+-- Keyset pagination for GET /api/v1/jobs.
+CREATE INDEX jobs_list_idx ON jobs (created_at DESC, id DESC);
 
 CREATE TABLE workers (
     id                uuid PRIMARY KEY,               -- generated per process start
@@ -130,6 +132,10 @@ CREATE TABLE job_attempts (                           -- append-only execution h
     UNIQUE (job_id, attempt)
 );
 ```
+
+The DDL above is the target schema. Migrations build it up phase by phase: `V2` creates
+`jobs` without the `locked_by` / `schedule_id` foreign keys, which are added by the
+migrations that create `workers` (Phase 2) and `schedules` (Phase 5).
 
 Schema reasoning:
 - **Partial indexes** keep the hot-path indexes proportional to the *active* queue, not
@@ -320,6 +326,22 @@ GET    /actuator/prometheus | /actuator/health
 **Idempotent submit**: `INSERT ... ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING *`;
 on no row returned, select and return the existing job. If the replay's body differs
 from the stored job, respond 409 rather than silently returning a different job.
+- Two concurrent submits of one key: the second `INSERT` blocks on the unique index until
+  the first commits, then does nothing, so exactly one caller sees `created`.
+- "Differs" is evaluated in SQL against the stored row (type, payload, priority,
+  max retries, timeout, run-at), so payloads compare with `jsonb` semantics: key order
+  and whitespace do not matter. A request that omits `runAt` matches any stored run-at,
+  because its implicit "now" is different on every call. `runAt` is truncated to
+  microseconds (the precision of `timestamptz`) before insert and compare.
+- The key is a body field and is global, not scoped per job type.
+
+**Listing** uses keyset pagination on `(created_at DESC, id DESC)` with an opaque cursor
+(base64 of the last row's position) rather than `OFFSET`: page cost stays constant and
+pages do not shift when new jobs are inserted mid-scan.
+
+**Validation limits**: `type` matches `[A-Za-z0-9._-]{1,100}`; `priority` in
+[-1000, 1000]; `maxRetries` in [0, 25]; `timeoutSeconds` in [1, 86400];
+`idempotencyKey` 1-255 chars. A `runAt` in the past is accepted and means "now".
 
 **Metrics** (Micrometer):
 - Counters: `jobs.submitted`, `jobs.claimed`, `jobs.succeeded`, `jobs.failed`,
@@ -386,6 +408,8 @@ approval status.
 | 2026-11-16 | Retry = PENDING with future `run_at` | One "waiting" state (§4) |
 | 2026-11-16 | Cron misfires fire once | Avoid catch-up floods (§8) |
 | 2026-11-16 | Single artifact, roles by config | Simple build, still scales api and workers independently (§2) |
+| 2026-11-16 | Idempotency replay with a different body returns 409 | Returning the old job would hide a client bug (§9) |
+| 2026-11-16 | Keyset pagination, not OFFSET | Constant cost, stable under inserts (§9) |
 | 2026-11-16 | `attempts` is monotonic; budget = `attempts - attempts_excused` | Release and requeue must not reuse an attempt number: it is the `job_attempts` key and the fencing token (§3) |
 | 2026-11-16 | Per-job execution timeout, enforced by the owning worker (Phase 4) | Worker heartbeats cannot see one hung handler; only the owner can interrupt it (§7) |
 | 2026-11-16 | Strict priority, starvation accepted and documented | Aging needs a stored effective priority to keep the claim index usable; deferred (§11) |
