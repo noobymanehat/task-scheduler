@@ -70,6 +70,38 @@ public class JobRepository {
     }
 
     /**
+     * Inserts the job for one tick of a schedule, with run_at set to the tick's nominal fire
+     * time. Returns false if a job with this tick's key already exists.
+     */
+    public boolean insertForSchedule(
+            UUID scheduleId,
+            String type,
+            String payloadJson,
+            int priority,
+            Instant runAt,
+            int maxRetries,
+            int timeoutSeconds,
+            String tickKey) {
+        return jdbc.sql("""
+                        INSERT INTO jobs (type, payload, priority, run_at, max_retries, timeout_seconds,
+                                          idempotency_key, schedule_id)
+                        VALUES (:type, CAST(:payload AS jsonb), :priority, :runAt, :maxRetries, :timeoutSeconds,
+                                :tickKey, :scheduleId)
+                        ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+                        """)
+                        .param("type", type)
+                        .param("payload", payloadJson)
+                        .param("priority", priority)
+                        .param("runAt", timestamptz(runAt))
+                        .param("maxRetries", maxRetries)
+                        .param("timeoutSeconds", timeoutSeconds)
+                        .param("tickKey", tickKey)
+                        .param("scheduleId", scheduleId)
+                        .update()
+                == 1;
+    }
+
+    /**
      * Finds the job holding an idempotency key and reports whether it was created by an
      * equivalent request. The comparison runs in SQL so JSON is compared with jsonb
      * semantics (key order and whitespace are irrelevant). A request that left run-at

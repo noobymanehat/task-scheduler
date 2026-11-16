@@ -1,6 +1,6 @@
 # Design
 
-Status: **Phases 0-4 complete** (scaffold, submit API, claim + execute, retries + DLQ, crash recovery + timeouts; last updated 2026-11-17). Phases 5-6 in §10 are
+Status: **Phases 0-5 complete** (scaffold, submit API, claim + execute, retries + DLQ, crash recovery + timeouts, cron schedules; last updated 2026-11-17). Phase 6 in §10 is
 designed but not built; this document is updated as each phase lands.
 
 Pinned versions: Java 21, Spring Boot 4.1.2, PostgreSQL 16 (`postgres:16-alpine` in both
@@ -122,6 +122,8 @@ CREATE TABLE schedules (
     created_at    timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX schedules_due_idx ON schedules (next_fire_at) WHERE enabled;
+-- Lets ON DELETE SET NULL find a schedule's jobs without a table scan.
+CREATE INDEX jobs_schedule_idx ON jobs (schedule_id) WHERE schedule_id IS NOT NULL;
 
 CREATE TABLE job_attempts (                           -- append-only execution history
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -376,22 +378,47 @@ another worker can pick the job up immediately.
 
 ## 8. Recurring cron schedules
 
-A schedule is a template that materialises ordinary jobs. Firing loop (every worker,
-default every 1s), in one transaction:
+A schedule is a template that materialises ordinary jobs, which then get everything jobs
+get: priority, retries, timeouts, the DLQ. The firing loop runs in every worker process
+(`scheduler.schedule.poll-interval`, default 1s). One pass is **one transaction**:
 
-1. `SELECT ... FROM schedules WHERE enabled AND next_fire_at <= now() FOR UPDATE SKIP LOCKED`
-2. Insert a job with idempotency key `schedule:<id>:<next_fire_at epoch>` (`ON CONFLICT DO NOTHING`).
-3. Set `last_fired_at`, compute the next `next_fire_at` strictly after `now()`.
+1. `SELECT *, now() FROM schedules WHERE enabled AND next_fire_at <= now()
+   ORDER BY next_fire_at LIMIT 100 FOR UPDATE SKIP LOCKED`
+2. For each: insert a job with `run_at = next_fire_at` (the tick's nominal time),
+   `schedule_id`, and idempotency key `schedule:<id>:<next_fire_at epoch millis>`
+   (`ON CONFLICT DO NOTHING`).
+3. Set `last_fired_at = now()` and `next_fire_at` to the first cron time strictly after
+   the transaction's `now()`.
 
-- The row lock makes concurrent firers skip each other; the idempotency key is a second,
-  independent guard. Either alone gives exactly-one-job-per-tick; both make it robust
-  to bugs in the other.
-- **Misfire policy: fire once, then skip ahead.** If the system was down for an hour, a
-  every-minute schedule produces one job, not sixty. Catch-up floods are rarely wanted.
-- Cron parsing uses Spring's `CronExpression` (6 fields, with seconds) evaluated in the
-  schedule's timezone. Invalid expressions are rejected at the API.
+- **Atomicity is the point of the transaction**: the job insert and the advance commit
+  together, so a crash mid-pass can neither lose a tick (advanced, no job) nor repeat one
+  (job, not advanced).
+- **Two independent guards give one job per tick.** The row lock makes concurrent firers
+  take disjoint schedules, and a firer arriving after a commit re-reads the advanced
+  `next_fire_at` and finds the schedule not due. Separately, the tick's idempotency key
+  admits one job even if the lock were somehow bypassed. Either alone suffices; both
+  make it robust to a bug in the other.
+- **Misfire policy: fire once, then skip ahead.** If the system was down for an hour, an
+  every-minute schedule produces one job, not sixty, because the next fire time is
+  computed from now rather than from the missed tick. Catch-up floods are rarely wanted.
+  The one job carries the original tick as `run_at`, so its lateness is visible.
+- **Next fire time is computed in Java, from the database clock.** The cron library lives
+  in the JVM, but "now" comes from the same query that locked the row, so worker clock
+  skew still cannot affect scheduling.
+- Cron parsing uses Spring's `CronExpression`: six fields
+  (`second minute hour day-of-month month day-of-week`) plus macros like `@hourly`.
+  Five-field Unix cron is rejected with a message saying so. Expressions are evaluated
+  in the schedule's timezone, so "09:00 daily" stays 09:00 local across daylight-saving
+  changes.
+- Rejected at the API (400): unparseable cron, unknown timezone, and expressions that can
+  never fire (e.g. 30 February). A row that becomes unusable anyway (hand-edited) is
+  disabled and logged instead of failing the whole batch.
+- **Pause / resume** are idempotent. Resume recomputes `next_fire_at` from now, so ticks
+  that passed while paused are not made up.
+- **Delete** keeps the jobs already created (`ON DELETE SET NULL`).
 - Overlap is allowed: if a run is still going when the next tick fires, a second job is
   created. (A "skip if previous still running" option is future work.)
+- No update endpoint: to change a schedule, delete and recreate it.
 
 ## 9. API and metrics
 
@@ -402,7 +429,7 @@ GET    /api/v1/jobs?status=&type=   keyset-paginated list
 POST   /api/v1/jobs/{id}/cancel     409 unless PENDING
 GET    /api/v1/dlq
 POST   /api/v1/dlq/{id}/requeue
-POST   /api/v1/schedules            also GET, GET /{id}, DELETE /{id}
+POST   /api/v1/schedules            also GET (up to 500, by name), GET /{id}, DELETE /{id}; 409 on duplicate name
 POST   /api/v1/schedules/{id}/pause | /resume
 GET    /api/v1/workers?status=      200 most recently started, with `runningJobs` per worker
 GET    /actuator/prometheus | /actuator/health
@@ -501,6 +528,9 @@ approval status.
 | 2026-11-17 | Abandoned (crashed) attempts are charged and retried without backoff | Charging makes poison jobs terminate; backoff would only add to the detection delay (§7) |
 | 2026-11-17 | Claim requires the worker to be ALIVE | A worker that does not yet know it was reaped cannot take new work (§7) |
 | 2026-11-17 | Timeout fails the job at the deadline; slot freed only when the handler exits | Retry is not blocked by a stuck handler; stuck handlers cost visible capacity, not unbounded threads (§7) |
+| 2026-11-17 | One transaction per firing pass (lock, insert job, advance) | A tick can be neither lost nor repeated by a crash mid-pass (§8) |
+| 2026-11-17 | Scheduled job's `run_at` is the nominal tick time | Lateness after a misfire shows up in queue-wait metrics (§8) |
+| 2026-11-17 | Tests share one Postgres container across Spring contexts | Faster, and fewer container startups to fail; wired by properties because Boot stops container beans with their context |
 | 2026-11-16 | `attempts` is monotonic; budget = `attempts - attempts_excused` | Release and requeue must not reuse an attempt number: it is the `job_attempts` key and the fencing token (§3) |
 | 2026-11-16 | Per-job execution timeout, enforced by the owning worker (Phase 4) | Worker heartbeats cannot see one hung handler; only the owner can interrupt it (§7) |
 | 2026-11-16 | Strict priority, starvation accepted and documented | Aging needs a stored effective priority to keep the claim index usable; deferred (§11) |

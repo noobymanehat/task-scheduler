@@ -29,3 +29,5 @@ scheduler:
     retry:
       base-delay: 5s
       max-delay: 1h
+  schedule:
+    poll-interval: 1s

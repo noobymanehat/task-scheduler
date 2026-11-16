@@ -4,6 +4,9 @@ import dev.scheduler.job.IdempotencyConflictException;
 import dev.scheduler.job.InvalidCursorException;
 import dev.scheduler.job.JobNotFoundException;
 import dev.scheduler.job.JobStateConflictException;
+import dev.scheduler.schedule.InvalidScheduleException;
+import dev.scheduler.schedule.ScheduleConflictException;
+import dev.scheduler.schedule.ScheduleNotFoundException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.springframework.http.HttpHeaders;
@@ -21,18 +24,22 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExcep
 @RestControllerAdvice
 public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
 
-    @ExceptionHandler(JobNotFoundException.class)
-    ProblemDetail notFound(JobNotFoundException e) {
+    @ExceptionHandler({JobNotFoundException.class, ScheduleNotFoundException.class})
+    ProblemDetail notFound(RuntimeException e) {
         return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, e.getMessage());
     }
 
-    @ExceptionHandler({JobStateConflictException.class, IdempotencyConflictException.class})
+    @ExceptionHandler({
+        JobStateConflictException.class,
+        IdempotencyConflictException.class,
+        ScheduleConflictException.class
+    })
     ProblemDetail conflict(RuntimeException e) {
         return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, e.getMessage());
     }
 
-    @ExceptionHandler(InvalidCursorException.class)
-    ProblemDetail badRequest(InvalidCursorException e) {
+    @ExceptionHandler({InvalidCursorException.class, InvalidScheduleException.class})
+    ProblemDetail badRequest(RuntimeException e) {
         return ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, e.getMessage());
     }
 

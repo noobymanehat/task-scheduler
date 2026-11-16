@@ -21,6 +21,6 @@ public abstract class IntegrationTest {
 
     @BeforeEach
     void emptyJobTables() {
-        jdbc.sql("TRUNCATE jobs, job_attempts").update();
+        jdbc.sql("TRUNCATE jobs, job_attempts, schedules").update();
     }
 }

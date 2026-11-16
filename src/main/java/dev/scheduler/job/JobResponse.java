@@ -17,6 +17,7 @@ public record JobResponse(
         int timeoutSeconds,
         String idempotencyKey,
         String lastError,
+        UUID scheduleId,
         Instant createdAt,
         Instant updatedAt,
         Instant finishedAt) {
@@ -35,6 +36,7 @@ public record JobResponse(
                 job.timeoutSeconds(),
                 job.idempotencyKey(),
                 job.lastError(),
+                job.scheduleId(),
                 job.createdAt(),
                 job.updatedAt(),
                 job.finishedAt());
