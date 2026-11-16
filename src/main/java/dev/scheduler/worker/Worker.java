@@ -5,6 +5,7 @@ import dev.scheduler.job.JobRepository;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.List;
+import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -34,6 +35,7 @@ public class Worker implements SmartLifecycle {
     private final HandlerRegistry handlers;
     private final WorkerProperties properties;
     private final Semaphore slots;
+    private final BackoffPolicy backoff;
     private final ExecutorService executor =
             Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("job-", 0).factory());
 
@@ -46,6 +48,7 @@ public class Worker implements SmartLifecycle {
         this.handlers = handlers;
         this.properties = properties;
         this.slots = new Semaphore(properties.concurrency());
+        this.backoff = new BackoffPolicy(properties.retry(), new Random()); // java.util.Random is thread-safe
     }
 
     public UUID id() {
@@ -146,21 +149,33 @@ public class Worker implements SmartLifecycle {
 
     private void execute(Job job) {
         String error = null;
+        boolean retryable = true;
         var handler = handlers.find(job.type());
         if (handler.isEmpty()) {
+            // No amount of retrying on this worker fleet will make a handler appear.
             error = "No handler registered for job type '" + job.type() + "'";
+            retryable = false;
         } else {
             try {
                 handler.get().handle(new JobContext(job.id(), job.type(), job.payload(), job.attempts()));
+            } catch (NonRetryableException e) {
+                error = describe(e);
+                retryable = false;
             } catch (Throwable t) {
                 error = describe(t);
             }
         }
         try {
-            // Fenced by (worker, attempt): false means this attempt no longer owns the job.
-            boolean recorded = error == null
-                    ? jobs.markSucceeded(job.id(), id, job.attempts())
-                    : jobs.markDead(job.id(), id, job.attempts(), error);
+            // Fenced by (worker, attempt): a stale result means this attempt no longer owns the job.
+            boolean recorded;
+            if (error == null) {
+                recorded = jobs.markSucceeded(job.id(), id, job.attempts());
+            } else {
+                int countedAttempt = job.attempts() - job.attemptsExcused();
+                recorded = jobs.markFailed(
+                                job.id(), id, job.attempts(), error, retryable, backoff.delay(countedAttempt))
+                        .isPresent();
+            }
             if (!recorded) {
                 log.warn("Worker {} discarded the result of job {} attempt {}: no longer the owner",
                         id, job.id(), job.attempts());

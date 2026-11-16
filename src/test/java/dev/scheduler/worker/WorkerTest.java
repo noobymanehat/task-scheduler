@@ -74,8 +74,8 @@ class WorkerTest extends WorkerTestSupport {
     }
 
     @Test
-    void failingHandlerLeavesTheJobDeadWithTheError() {
-        Job job = submit("boom");
+    void failingHandlerWithNoRetriesLeavesTheJobDeadWithTheError() {
+        Job job = submitWithMaxRetries("boom", 0);
 
         startWorker(1, TestHandlers.of("boom", ctx -> {
             throw new IllegalStateException("kaboom");
@@ -100,11 +100,13 @@ class WorkerTest extends WorkerTestSupport {
 
         await().atMost(TIMEOUT).until(() -> reload(job).status() == JobStatus.DEAD);
         assertThat(reload(job).lastError()).contains("No handler registered").contains("nobody-handles-this");
+        // Not retried, although the job had retries left.
+        assertThat(reload(job).attempts()).isEqualTo(1);
     }
 
     @Test
     void oneFailingJobDoesNotStopTheWorker() {
-        Job bad = submit("flaky", 10, null);
+        Job bad = submitWithMaxRetries("flaky", 0);
         Job good = submit("ok", 0, null);
 
         startWorker(
@@ -115,7 +117,7 @@ class WorkerTest extends WorkerTestSupport {
                 TestHandlers.of("ok", ctx -> {}));
 
         await().atMost(TIMEOUT).until(() -> reload(good).status() == JobStatus.SUCCEEDED);
-        assertThat(reload(bad).status()).isEqualTo(JobStatus.DEAD);
+        await().atMost(TIMEOUT).until(() -> reload(bad).status() == JobStatus.DEAD);
     }
 
     @Test

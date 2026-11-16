@@ -1,6 +1,6 @@
 # Design
 
-Status: **Phases 0-2 complete** (scaffold, submit API, claim + execute; last updated 2026-11-17). Phases 3-6 in §10 are
+Status: **Phases 0-3 complete** (scaffold, submit API, claim + execute, retries + DLQ; last updated 2026-11-17). Phases 4-6 in §10 are
 designed but not built; this document is updated as each phase lands.
 
 Pinned versions: Java 21, Spring Boot 4.1.2, PostgreSQL 16 (`postgres:16-alpine` in both
@@ -256,8 +256,9 @@ SELECT * FROM claimed ORDER BY priority DESC, run_at, id;
   If the ack cannot be written (database unreachable), the job stays RUNNING under the
   worker's id and is recovered by the reaper (§7). `Throwable`, not just `Exception`,
   is caught around handlers so an `Error` in one job cannot leak a slot.
-- **Phase 2 interim behaviour**: any handler failure sends the job straight to DEAD.
-  Retries with backoff replace this in Phase 3. Handlers implement
+- **Failures** go through one fenced statement (`markFailed`) in which the database
+  itself decides retry-or-dead from the row being updated, so the budget check cannot
+  race with anything (§6). Handlers implement
   `JobHandler { String type(); void handle(JobContext ctx) throws Exception; }` and are
   discovered as Spring beans. A job with an unknown type fails straight to DEAD.
 
@@ -267,8 +268,17 @@ SELECT * FROM claimed ORDER BY priority DESC, run_at, id;
   `min(cap, base * 2^(n-1))`, then **full jitter**
   (uniform in `[0, delay]`). Defaults: base 5s, cap 1h. Jitter prevents a burst of
   jobs that failed together (downstream outage) from retrying together.
+- Full jitter means a retry can be almost immediate; that is the accepted cost of
+  spreading retries over the whole interval rather than clustering them near the ceiling.
 - Backoff is implemented by setting `run_at`; there is no separate delay queue.
-- A handler may throw `NonRetryableException` to go straight to DEAD.
+- The worker computes the delay (config: `scheduler.worker.retry.base-delay`,
+  `max-delay`) and passes it to the failure statement; the statement decides the
+  outcome: `PENDING` if the failure is retryable and
+  `attempts - attempts_excused <= max_retries`, else `DEAD`.
+- A handler may throw `NonRetryableException` to go straight to DEAD. A job whose type
+  has no registered handler is also non-retryable.
+- `last_error` holds the most recent failure and is kept across requeue and later
+  success; per-attempt errors live in `job_attempts`.
 - **The DLQ is `status = 'DEAD'` in the same table**, not a separate table. Moving to
   the DLQ is then a single atomic guarded update, requeue is another, and the row keeps
   its id and history. The usual argument for a separate table (keeping the hot table
@@ -276,7 +286,10 @@ SELECT * FROM claimed ORDER BY priority DESC, run_at, id;
 - **Requeue** sets `status = 'PENDING', run_at = now(), attempts_excused = attempts`,
   giving a fresh retry budget while attempt numbering continues (a job that died on
   attempt 4 is next claimed as attempt 5). It does not reset `attempts` to 0 (§3).
-- API: `GET /api/v1/dlq`, `POST /api/v1/dlq/{id}/requeue`.
+- API: `GET /api/v1/dlq` (most recently dead first, keyset on `(finished_at, id)` using
+  `jobs_dead_idx`, optional `type` filter), `POST /api/v1/dlq/{id}/requeue` (409 unless DEAD).
+- Job responses expose both `attempts` and `attemptsExcused`, so a requeued job showing
+  `attempts: 4, maxRetries: 3` is explicable.
 
 ## 7. Heartbeats and crash recovery
 
@@ -435,6 +448,7 @@ approval status.
 | 2026-11-16 | Idempotency replay with a different body returns 409 | Returning the old job would hide a client bug (§9) |
 | 2026-11-16 | Keyset pagination, not OFFSET | Constant cost, stable under inserts (§9) |
 | 2026-11-17 | Claim via a materialized CTE that also inserts the attempt row | `IN (subquery)` can exceed LIMIT under some plans; one statement keeps job and history consistent (§5) |
+| 2026-11-17 | Retry-or-dead decided inside the failure UPDATE | The budget check reads the same row version it writes; no read-then-write (§6) |
 | 2026-11-16 | `attempts` is monotonic; budget = `attempts - attempts_excused` | Release and requeue must not reuse an attempt number: it is the `job_attempts` key and the fencing token (§3) |
 | 2026-11-16 | Per-job execution timeout, enforced by the owning worker (Phase 4) | Worker heartbeats cannot see one hung handler; only the owner can interrupt it (§7) |
 | 2026-11-16 | Strict priority, starvation accepted and documented | Aging needs a stored effective priority to keep the claim index usable; deferred (§11) |

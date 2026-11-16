@@ -29,13 +29,18 @@ abstract class WorkerTestSupport extends IntegrationTest {
         started.clear();
     }
 
-    /** A running worker polling every 10 ms; stopped automatically after the test. */
+    /** A running worker polling every 10 ms with 1-5 ms retry backoff; stopped automatically after the test. */
     protected Worker startWorker(int concurrency, JobHandler... handlers) {
         var worker = new Worker(
                 jobs,
                 workers,
                 new HandlerRegistry(List.of(handlers)),
-                new WorkerProperties(true, concurrency, Duration.ofMillis(10), Duration.ofSeconds(10)));
+                new WorkerProperties(
+                        true,
+                        concurrency,
+                        Duration.ofMillis(10),
+                        Duration.ofSeconds(10),
+                        new WorkerProperties.Retry(Duration.ofMillis(1), Duration.ofMillis(5))));
         worker.start();
         started.add(worker);
         return worker;
@@ -54,6 +59,10 @@ abstract class WorkerTestSupport extends IntegrationTest {
 
     protected Job submit(String type, int priority, Instant runAt) {
         return jobs.insert(new NewJob(type, "{}", priority, runAt, 3, 300, null)).orElseThrow();
+    }
+
+    protected Job submitWithMaxRetries(String type, int maxRetries) {
+        return jobs.insert(new NewJob(type, "{}", 0, null, maxRetries, 300, null)).orElseThrow();
     }
 
     protected Job reload(Job job) {

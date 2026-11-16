@@ -56,7 +56,7 @@ public class JobService {
         Cursor after = cursor == null ? null : Cursor.decode(cursor);
         // Fetch one extra row to learn whether another page exists.
         List<Job> rows = jobs.list(
-                status, type, after == null ? null : after.createdAt(), after == null ? null : after.id(), pageSize + 1);
+                status, type, after == null ? null : after.position(), after == null ? null : after.id(), pageSize + 1);
         boolean hasMore = rows.size() > pageSize;
         List<Job> page = hasMore ? rows.subList(0, pageSize) : rows;
         String next = hasMore ? new Cursor(page.getLast().createdAt(), page.getLast().id()).encode() : null;
@@ -67,7 +67,25 @@ public class JobService {
         return jobs.cancel(id).orElseThrow(() -> {
             // The guarded UPDATE matched nothing; look up why, purely to pick the error.
             Job current = get(id);
-            return new JobNotCancellableException(id, current.status());
+            return new JobStateConflictException(id, current.status(), "only PENDING jobs can be cancelled");
+        });
+    }
+
+    public JobPage listDead(String type, int limit, String cursor) {
+        int pageSize = Math.clamp(limit, 1, MAX_PAGE_SIZE);
+        Cursor after = cursor == null ? null : Cursor.decode(cursor);
+        List<Job> rows = jobs.listDead(
+                type, after == null ? null : after.position(), after == null ? null : after.id(), pageSize + 1);
+        boolean hasMore = rows.size() > pageSize;
+        List<Job> page = hasMore ? rows.subList(0, pageSize) : rows;
+        String next = hasMore ? new Cursor(page.getLast().finishedAt(), page.getLast().id()).encode() : null;
+        return new JobPage(page.stream().map(JobResponse::from).toList(), next);
+    }
+
+    public Job requeue(UUID id) {
+        return jobs.requeue(id).orElseThrow(() -> {
+            Job current = get(id);
+            return new JobStateConflictException(id, current.status(), "only DEAD jobs can be requeued");
         });
     }
 
@@ -85,13 +103,13 @@ public class JobService {
 
     public record Submission(Job job, boolean created) {}
 
-    /** Opaque keyset position: the (created_at, id) of the last row already returned. */
-    record Cursor(Instant createdAt, UUID id) {
+    /** Opaque keyset position: the (sort timestamp, id) of the last row already returned. */
+    record Cursor(Instant position, UUID id) {
 
         String encode() {
             return Base64.getUrlEncoder()
                     .withoutPadding()
-                    .encodeToString((createdAt + "|" + id).getBytes(StandardCharsets.UTF_8));
+                    .encodeToString((position + "|" + id).getBytes(StandardCharsets.UTF_8));
         }
 
         static Cursor decode(String cursor) {

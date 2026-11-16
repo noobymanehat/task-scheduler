@@ -2,8 +2,8 @@ package dev.scheduler.common;
 
 import dev.scheduler.job.IdempotencyConflictException;
 import dev.scheduler.job.InvalidCursorException;
-import dev.scheduler.job.JobNotCancellableException;
 import dev.scheduler.job.JobNotFoundException;
+import dev.scheduler.job.JobStateConflictException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.springframework.http.HttpHeaders;
@@ -26,7 +26,7 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
         return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, e.getMessage());
     }
 
-    @ExceptionHandler({JobNotCancellableException.class, IdempotencyConflictException.class})
+    @ExceptionHandler({JobStateConflictException.class, IdempotencyConflictException.class})
     ProblemDetail conflict(RuntimeException e) {
         return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, e.getMessage());
     }

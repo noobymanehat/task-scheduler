@@ -23,3 +23,6 @@ scheduler:
     concurrency: 10
     poll-interval: 1s
     shutdown-grace: 30s
+    retry:
+      base-delay: 5s
+      max-delay: 1h

@@ -2,6 +2,7 @@ package dev.scheduler.job;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -174,26 +175,16 @@ public class JobRepository {
      * Returns false for a stale ack (the job was reclaimed, or already finished).
      */
     public boolean markSucceeded(UUID jobId, UUID workerId, int attempt) {
-        return finish(jobId, workerId, attempt, "SUCCEEDED", "SUCCEEDED", null);
-    }
-
-    /** RUNNING -> DEAD with the same fencing as {@link #markSucceeded}. */
-    public boolean markDead(UUID jobId, UUID workerId, int attempt, String error) {
-        return finish(jobId, workerId, attempt, "DEAD", "FAILED", error);
-    }
-
-    private boolean finish(UUID jobId, UUID workerId, int attempt, String status, String outcome, String error) {
         return jdbc.sql("""
                         WITH done AS (
                             UPDATE jobs
-                            SET status = :status, finished_at = now(), updated_at = now(),
-                                locked_by = NULL, locked_at = NULL,
-                                last_error = COALESCE(CAST(:error AS text), last_error)
+                            SET status = 'SUCCEEDED', finished_at = now(), updated_at = now(),
+                                locked_by = NULL, locked_at = NULL
                             WHERE id = :id AND status = 'RUNNING' AND locked_by = :worker AND attempts = :attempt
                             RETURNING id, attempts
                         ), closed AS (
                             UPDATE job_attempts a
-                            SET finished_at = now(), outcome = :outcome, error = CAST(:error AS text)
+                            SET finished_at = now(), outcome = 'SUCCEEDED'
                             FROM done
                             WHERE a.job_id = done.id AND a.attempt = done.attempts
                         )
@@ -202,12 +193,92 @@ public class JobRepository {
                         .param("id", jobId)
                         .param("worker", workerId)
                         .param("attempt", attempt)
-                        .param("status", status)
-                        .param("outcome", outcome)
-                        .param("error", error)
                         .query(Long.class)
                         .single()
                 == 1;
+    }
+
+    /**
+     * Records a failed attempt, with the same fencing as {@link #markSucceeded}. The database
+     * decides the next state from the row it is updating: back to PENDING with
+     * {@code run_at = now() + retryDelay} if the failure is retryable and budget remains
+     * ({@code attempts - attempts_excused <= max_retries}), otherwise DEAD.
+     *
+     * @return the job's new status, or empty for a stale ack
+     */
+    public Optional<JobStatus> markFailed(
+            UUID jobId, UUID workerId, int attempt, String error, boolean retryable, Duration retryDelay) {
+        return jdbc.sql("""
+                        WITH target AS (
+                            SELECT id, (:retryable AND attempts - attempts_excused <= max_retries) AS retry
+                            FROM jobs
+                            WHERE id = :id AND status = 'RUNNING' AND locked_by = :worker AND attempts = :attempt
+                            FOR UPDATE
+                        ), done AS (
+                            UPDATE jobs j
+                            SET status = CASE WHEN target.retry THEN 'PENDING' ELSE 'DEAD' END,
+                                run_at = CASE WHEN target.retry
+                                              THEN now() + :delayMillis * interval '1 millisecond'
+                                              ELSE j.run_at END,
+                                finished_at = CASE WHEN target.retry THEN NULL ELSE now() END,
+                                locked_by = NULL, locked_at = NULL,
+                                last_error = :error, updated_at = now()
+                            FROM target
+                            WHERE j.id = target.id
+                            RETURNING j.id, j.attempts, j.status
+                        ), closed AS (
+                            UPDATE job_attempts a
+                            SET finished_at = now(), outcome = 'FAILED', error = :error
+                            FROM done
+                            WHERE a.job_id = done.id AND a.attempt = done.attempts
+                        )
+                        SELECT status FROM done
+                        """)
+                .param("id", jobId)
+                .param("worker", workerId)
+                .param("attempt", attempt)
+                .param("error", error)
+                .param("retryable", retryable)
+                .param("delayMillis", retryDelay.toMillis())
+                .query(String.class)
+                .optional()
+                .map(JobStatus::valueOf);
+    }
+
+    /** Dead jobs, most recently dead first, keyset-paginated on (finished_at, id). */
+    public List<Job> listDead(String type, Instant afterFinishedAt, UUID afterId, int limit) {
+        var sql = new StringBuilder("SELECT * FROM jobs WHERE status = 'DEAD'");
+        Map<String, Object> params = new HashMap<>();
+        if (type != null) {
+            sql.append(" AND type = :type");
+            params.put("type", type);
+        }
+        if (afterFinishedAt != null) {
+            sql.append(" AND (finished_at, id) < (:afterFinishedAt, :afterId)");
+            params.put("afterFinishedAt", timestamptz(afterFinishedAt));
+            params.put("afterId", afterId);
+        }
+        sql.append(" ORDER BY finished_at DESC, id DESC LIMIT :limit");
+        params.put("limit", limit);
+        return jdbc.sql(sql.toString()).params(params).query(jobMapper).list();
+    }
+
+    /**
+     * DEAD -> PENDING, runnable now, with a fresh retry budget. The budget is restored by
+     * excusing every attempt so far; {@code attempts} itself is never reset, so the next
+     * claim gets a new attempt number (DESIGN.md §3).
+     */
+    public Optional<Job> requeue(UUID id) {
+        return jdbc.sql("""
+                        UPDATE jobs
+                        SET status = 'PENDING', run_at = now(), attempts_excused = attempts,
+                            finished_at = NULL, updated_at = now()
+                        WHERE id = :id AND status = 'DEAD'
+                        RETURNING *
+                        """)
+                .param("id", id)
+                .query(jobMapper)
+                .optional();
     }
 
     public List<JobAttempt> findAttempts(UUID jobId) {

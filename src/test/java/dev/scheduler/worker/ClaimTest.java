@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import dev.scheduler.job.Job;
 import dev.scheduler.job.JobAttempt;
 import dev.scheduler.job.JobStatus;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
@@ -121,7 +122,9 @@ class ClaimTest extends WorkerTestSupport {
         assertThat(secondClaim.attempts()).isEqualTo(2);
 
         boolean staleSuccess = jobs.markSucceeded(firstClaim.id(), workerA, firstClaim.attempts());
-        boolean staleFailure = jobs.markDead(firstClaim.id(), workerA, firstClaim.attempts(), "late failure");
+        boolean staleFailure = jobs.markFailed(
+                        firstClaim.id(), workerA, firstClaim.attempts(), "late failure", true, Duration.ZERO)
+                .isPresent();
 
         assertThat(staleSuccess).isFalse();
         assertThat(staleFailure).isFalse();
@@ -155,7 +158,7 @@ class ClaimTest extends WorkerTestSupport {
         assertThat(jobs.markSucceeded(job.id(), worker, job.attempts())).isTrue();
 
         assertThat(jobs.markSucceeded(job.id(), worker, job.attempts())).isFalse();
-        assertThat(jobs.markDead(job.id(), worker, job.attempts(), "too late")).isFalse();
+        assertThat(jobs.markFailed(job.id(), worker, job.attempts(), "too late", true, Duration.ZERO)).isEmpty();
         assertThat(reload(job).status()).isEqualTo(JobStatus.SUCCEEDED);
     }
 
