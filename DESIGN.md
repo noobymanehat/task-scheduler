@@ -1,6 +1,6 @@
 # Design
 
-Status: **Phases 0-3 complete** (scaffold, submit API, claim + execute, retries + DLQ; last updated 2026-11-17). Phases 4-6 in §10 are
+Status: **Phases 0-4 complete** (scaffold, submit API, claim + execute, retries + DLQ, crash recovery + timeouts; last updated 2026-11-17). Phases 5-6 in §10 are
 designed but not built; this document is updated as each phase lands.
 
 Pinned versions: Java 21, Spring Boot 4.1.2, PostgreSQL 16 (`postgres:16-alpine` in both
@@ -102,6 +102,9 @@ CREATE TABLE workers (
     status            text        NOT NULL DEFAULT 'ALIVE'
                       CHECK (status IN ('ALIVE','STOPPED','DEAD'))
 );
+
+-- Reaper: expired ALIVE workers, without scanning old STOPPED/DEAD rows.
+CREATE INDEX workers_alive_idx ON workers (last_heartbeat_at) WHERE status = 'ALIVE';
 
 CREATE TABLE schedules (
     id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -293,38 +296,83 @@ SELECT * FROM claimed ORDER BY priority DESC, run_at, id;
 
 ## 7. Heartbeats and crash recovery
 
+All timeout comparisons use database `now()`, so worker clock skew is irrelevant.
+
+### Heartbeat
 - Each worker registers a row in `workers` at start and updates `last_heartbeat_at`
-  every `heartbeat-interval` (default 5s) from a dedicated thread with its own
-  connection budget, so a saturated job executor cannot starve the heartbeat.
-- **Reaper** (every worker, default every 10s): mark workers whose heartbeat is older
-  than `heartbeat-timeout` (default 30s) as DEAD, then move their RUNNING jobs to
-  PENDING (or DEAD if attempts are exhausted) and close the open `job_attempts` row as
-  ABANDONED. All in one transaction, selecting dead workers `FOR UPDATE SKIP LOCKED`
-  so concurrent reapers do not duplicate work.
+  every `heartbeat-interval` (default 5s) from a dedicated platform thread, so heartbeats
+  never queue behind job execution. (It shares the connection pool; handlers hold no
+  connection while running, so the pool is only used for short claim/ack statements.)
+- `heartbeat-timeout` (default 30s) must be at least twice the interval; this is
+  validated at startup so one late heartbeat cannot get a healthy worker reaped.
 - **Why worker-level heartbeats rather than per-job leases**: one row update per worker
   per interval, instead of one per running job. The cost is that a single hung handler
   on a live worker is invisible to the reaper; the execution timeout below covers that.
-- **Execution timeout** (hung handler on a live worker): each job has `timeout_seconds`
-  (API-settable, default 300). The owning worker enforces it: a watchdog interrupts the
-  handler's virtual thread at the deadline and fails the attempt through the normal
-  fenced failure path (`job_attempts.outcome = 'TIMED_OUT'`, counted against the budget,
-  then backoff or DEAD). Consequences and limits:
-  - Enforcement is worker-side because only the owner can interrupt the handler. If the
-    whole worker is hung, its heartbeat stops and the reaper handles it instead.
-  - Interruption is cooperative. A handler that ignores interrupts keeps running after
-    its job has been failed and retried elsewhere (another reason handlers must be
-    idempotent). Its executor slot is only freed when the thread actually exits, so a
-    stuck handler shows up as lost capacity (`jobs.handlers.stuck` gauge) rather than as
-    unbounded thread growth. Its eventual late ack is rejected by fencing.
-- **Self-fencing**: if a worker's heartbeat update finds its row marked DEAD (it was
-  partitioned and reaped), it stops claiming, abandons in-flight results, and
-  re-registers under a new id.
-- **Graceful shutdown** (SIGTERM): stop polling, wait up to a grace period for in-flight
-  jobs, release anything unfinished back to PENDING *without* consuming retry budget,
-  mark the worker STOPPED. Rolling deploys therefore do not burn retries. Release keeps
-  `attempts` as is and does `attempts_excused + 1`, closing the `job_attempts` row as
-  RELEASED; the next claim gets a fresh attempt number (§3).
-- All timeout comparisons use database `now()`, so worker clock skew is irrelevant.
+
+### Reaper
+Runs in every worker process (default every 10s, jittered). One pass is two statements:
+
+1. `ALIVE -> DEAD` for workers whose heartbeat is older than the timeout
+   (`FOR UPDATE SKIP LOCKED`, backed by `workers_alive_idx`).
+2. Reclaim every RUNNING job whose `locked_by` worker is **not ALIVE** (join via
+   `jobs_running_idx`, `FOR UPDATE OF jobs SKIP LOCKED`): to PENDING with
+   `run_at = now()`, or DEAD if the budget is spent; the open `job_attempts` row is
+   closed as ABANDONED.
+
+- The two steps are deliberately not one transaction. Step 2 sweeps the jobs of *all*
+  non-ALIVE workers, not only those step 1 just marked, so the pass is idempotent: if a
+  reaper dies between the steps, any reaper's next pass finishes the work.
+- Concurrent reapers split rows via `SKIP LOCKED`, and a locked row is re-checked
+  against the `WHERE` clause, so each job is reclaimed exactly once.
+- An abandoned attempt **is charged** to the retry budget and retried immediately (no
+  backoff: the failure was the worker's, and detection already took a timeout). Because
+  it is charged, a poison job that kills every worker that touches it reaches the DLQ
+  after `max_retries + 1` crashes.
+- A zombie's late ack loses to the reaper either way: whichever statement locks the job
+  row first wins, and the other finds its `WHERE` guard false.
+
+### Claim guard and self-fencing
+- The claim query requires the claiming worker to be ALIVE
+  (`EXISTS (SELECT 1 FROM workers WHERE id = :worker AND status = 'ALIVE')`). A worker
+  that has been declared dead but does not know yet claims nothing. The narrow race
+  where a claim and the DEAD mark interleave is covered by reaper step 2.
+- If a heartbeat update matches no row, the worker has been declared dead (it was
+  stalled or partitioned, not actually dead). It marks every execution claimed under
+  that identity as abandoned, interrupts those handlers, registers a fresh id, and
+  continues under it. Results of abandoned executions are never written.
+
+### Execution timeout
+Covers a hung handler on a live worker. Each job has `timeout_seconds` (API-settable,
+default 300). The owning worker schedules a watchdog per execution. At the deadline it
+fails the attempt through the normal fenced failure path
+(`job_attempts.outcome = 'TIMED_OUT'`, charged to the budget, then backoff or DEAD) and
+interrupts the handler's virtual thread.
+
+- Enforcement is worker-side because only the owner can interrupt the handler. If the
+  whole worker is hung, its heartbeat stops and the reaper handles it instead.
+- The job is failed **at the deadline**, not when the handler eventually returns, so a
+  retry elsewhere is not held hostage by a stuck handler.
+- Interruption is cooperative. A handler that ignores interrupts keeps running after its
+  job has been failed and possibly retried (another reason handlers must be idempotent).
+  Its executor slot is only freed when the thread actually exits, so a stuck handler
+  shows up as lost capacity (`Worker.stuckHandlers()`, exported as the
+  `jobs.handlers.stuck` gauge in Phase 6) rather than as unbounded thread growth.
+
+### One writer per execution
+Four parties can end a running execution: the handler returning, the timeout watchdog,
+shutdown release, and self-fencing. Each execution carries an atomic state
+(`RUNNING -> FINISHED | TIMED_OUT | RELEASED | ABANDONED`) and only the party that wins
+the compare-and-set writes to the database. This is an in-process optimisation and a
+source of clean logs; correctness across processes still rests on the SQL fencing.
+
+### Graceful shutdown
+On SIGTERM: stop polling, wait up to `shutdown-grace` for in-flight jobs, then release
+anything unfinished back to PENDING *without* consuming retry budget, interrupt those
+handlers, and mark the worker STOPPED. The heartbeat keeps running until the end so a
+draining worker is not reaped. Rolling deploys therefore do not burn retries. Release
+keeps `attempts` as is and does `attempts_excused + 1`, closing the `job_attempts` row
+as RELEASED; the next claim gets a fresh attempt number (§3). `run_at` is untouched, so
+another worker can pick the job up immediately.
 
 ## 8. Recurring cron schedules
 
@@ -356,7 +404,7 @@ GET    /api/v1/dlq
 POST   /api/v1/dlq/{id}/requeue
 POST   /api/v1/schedules            also GET, GET /{id}, DELETE /{id}
 POST   /api/v1/schedules/{id}/pause | /resume
-GET    /api/v1/workers
+GET    /api/v1/workers?status=      200 most recently started, with `runningJobs` per worker
 GET    /actuator/prometheus | /actuator/health
 ```
 
@@ -449,6 +497,10 @@ approval status.
 | 2026-11-16 | Keyset pagination, not OFFSET | Constant cost, stable under inserts (§9) |
 | 2026-11-17 | Claim via a materialized CTE that also inserts the attempt row | `IN (subquery)` can exceed LIMIT under some plans; one statement keeps job and history consistent (§5) |
 | 2026-11-17 | Retry-or-dead decided inside the failure UPDATE | The budget check reads the same row version it writes; no read-then-write (§6) |
+| 2026-11-17 | Reaper pass is two idempotent statements, not one transaction | Step 2 sweeps all non-ALIVE workers' jobs, so a half-finished pass is completed by the next one (§7) |
+| 2026-11-17 | Abandoned (crashed) attempts are charged and retried without backoff | Charging makes poison jobs terminate; backoff would only add to the detection delay (§7) |
+| 2026-11-17 | Claim requires the worker to be ALIVE | A worker that does not yet know it was reaped cannot take new work (§7) |
+| 2026-11-17 | Timeout fails the job at the deadline; slot freed only when the handler exits | Retry is not blocked by a stuck handler; stuck handlers cost visible capacity, not unbounded threads (§7) |
 | 2026-11-16 | `attempts` is monotonic; budget = `attempts - attempts_excused` | Release and requeue must not reuse an attempt number: it is the `job_attempts` key and the fencing token (§3) |
 | 2026-11-16 | Per-job execution timeout, enforced by the owning worker (Phase 4) | Worker heartbeats cannot see one hung handler; only the owner can interrupt it (§7) |
 | 2026-11-16 | Strict priority, starvation accepted and documented | Aging needs a stored effective priority to keep the claim index usable; deferred (§11) |

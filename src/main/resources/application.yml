@@ -23,6 +23,9 @@ scheduler:
     concurrency: 10
     poll-interval: 1s
     shutdown-grace: 30s
+    heartbeat-interval: 5s
+    heartbeat-timeout: 30s
+    reaper-interval: 10s
     retry:
       base-delay: 5s
       max-delay: 1h

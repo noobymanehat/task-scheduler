@@ -5,11 +5,14 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 
 /**
- * @param enabled       whether this process runs a worker
- * @param concurrency   maximum number of jobs executing at once in this worker
- * @param pollInterval  pause between claim queries when the queue did not fill a batch
- * @param shutdownGrace how long shutdown waits for in-flight jobs
- * @param retry         backoff between failed attempts
+ * @param enabled           whether this process runs a worker (and a reaper)
+ * @param concurrency       maximum number of jobs executing at once in this worker
+ * @param pollInterval      pause between claim queries when the queue did not fill a batch
+ * @param shutdownGrace     how long shutdown waits for in-flight jobs before releasing them
+ * @param heartbeatInterval how often the worker refreshes its heartbeat
+ * @param heartbeatTimeout  heartbeat age beyond which a worker is declared dead
+ * @param reaperInterval    how often the reaper looks for dead workers
+ * @param retry             backoff between failed attempts
  */
 @ConfigurationProperties("scheduler.worker")
 public record WorkerProperties(
@@ -17,11 +20,19 @@ public record WorkerProperties(
         @DefaultValue("10") int concurrency,
         @DefaultValue("1s") Duration pollInterval,
         @DefaultValue("30s") Duration shutdownGrace,
+        @DefaultValue("5s") Duration heartbeatInterval,
+        @DefaultValue("30s") Duration heartbeatTimeout,
+        @DefaultValue("10s") Duration reaperInterval,
         @DefaultValue Retry retry) {
 
     public WorkerProperties {
         if (concurrency < 1) {
             throw new IllegalArgumentException("scheduler.worker.concurrency must be at least 1");
+        }
+        if (heartbeatTimeout.compareTo(heartbeatInterval.multipliedBy(2)) < 0) {
+            // With less headroom, one delayed heartbeat gets a healthy worker reaped.
+            throw new IllegalArgumentException(
+                    "scheduler.worker.heartbeat-timeout must be at least twice heartbeat-interval");
         }
     }
 

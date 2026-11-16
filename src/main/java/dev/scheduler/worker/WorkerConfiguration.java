@@ -22,4 +22,10 @@ public class WorkerConfiguration {
     Worker worker(JobRepository jobs, WorkerRepository workers, HandlerRegistry handlers, WorkerProperties properties) {
         return new Worker(jobs, workers, handlers, properties);
     }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "scheduler.worker", name = "enabled", matchIfMissing = true)
+    Reaper reaper(WorkerRepository workers, JobRepository jobs, WorkerProperties properties) {
+        return new Reaper(workers, jobs, properties.heartbeatTimeout(), properties.reaperInterval());
+    }
 }

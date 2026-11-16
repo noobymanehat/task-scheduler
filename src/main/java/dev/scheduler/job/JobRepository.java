@@ -142,12 +142,15 @@ public class JobRepository {
      * <p>FOR UPDATE SKIP LOCKED makes concurrent claimers pass over each other's rows instead
      * of blocking on them. The pick is a MATERIALIZED CTE rather than {@code id IN (subquery)}
      * so the locking subquery runs exactly once and LIMIT is honoured whatever plan is chosen.
+     *
+     * <p>A worker that is not ALIVE (declared dead by a reaper, or stopped) claims nothing.
      */
     public List<Job> claim(UUID workerId, int limit) {
         return jdbc.sql("""
                         WITH picked AS MATERIALIZED (
                             SELECT id FROM jobs
                             WHERE status = 'PENDING' AND run_at <= now()
+                              AND EXISTS (SELECT 1 FROM workers w WHERE w.id = :worker AND w.status = 'ALIVE')
                             ORDER BY priority DESC, run_at, id
                             LIMIT :limit
                             FOR UPDATE SKIP LOCKED
@@ -208,6 +211,22 @@ public class JobRepository {
      */
     public Optional<JobStatus> markFailed(
             UUID jobId, UUID workerId, int attempt, String error, boolean retryable, Duration retryDelay) {
+        return fail(jobId, workerId, attempt, error, retryable, retryDelay, "FAILED");
+    }
+
+    /** As {@link #markFailed} (retryable), recorded as a TIMED_OUT attempt. */
+    public Optional<JobStatus> markTimedOut(UUID jobId, UUID workerId, int attempt, String error, Duration retryDelay) {
+        return fail(jobId, workerId, attempt, error, true, retryDelay, "TIMED_OUT");
+    }
+
+    private Optional<JobStatus> fail(
+            UUID jobId,
+            UUID workerId,
+            int attempt,
+            String error,
+            boolean retryable,
+            Duration retryDelay,
+            String outcome) {
         return jdbc.sql("""
                         WITH target AS (
                             SELECT id, (:retryable AND attempts - attempts_excused <= max_retries) AS retry
@@ -228,7 +247,7 @@ public class JobRepository {
                             RETURNING j.id, j.attempts, j.status
                         ), closed AS (
                             UPDATE job_attempts a
-                            SET finished_at = now(), outcome = 'FAILED', error = :error
+                            SET finished_at = now(), outcome = :outcome, error = :error
                             FROM done
                             WHERE a.job_id = done.id AND a.attempt = done.attempts
                         )
@@ -240,9 +259,85 @@ public class JobRepository {
                 .param("error", error)
                 .param("retryable", retryable)
                 .param("delayMillis", retryDelay.toMillis())
+                .param("outcome", outcome)
                 .query(String.class)
                 .optional()
                 .map(JobStatus::valueOf);
+    }
+
+    /**
+     * RUNNING -> PENDING at graceful shutdown, fenced like an ack. The attempt is excused
+     * ({@code attempts_excused + 1}) so it does not count against the retry budget, while
+     * {@code attempts} stays put so the next claim gets a new attempt number. run_at is left
+     * alone: the job is immediately claimable by another worker.
+     */
+    public boolean release(UUID jobId, UUID workerId, int attempt) {
+        return jdbc.sql("""
+                        WITH done AS (
+                            UPDATE jobs
+                            SET status = 'PENDING', attempts_excused = attempts_excused + 1,
+                                locked_by = NULL, locked_at = NULL, updated_at = now()
+                            WHERE id = :id AND status = 'RUNNING' AND locked_by = :worker AND attempts = :attempt
+                            RETURNING id, attempts
+                        ), closed AS (
+                            UPDATE job_attempts a
+                            SET finished_at = now(), outcome = 'RELEASED'
+                            FROM done
+                            WHERE a.job_id = done.id AND a.attempt = done.attempts
+                        )
+                        SELECT count(*) FROM done
+                        """)
+                        .param("id", jobId)
+                        .param("worker", workerId)
+                        .param("attempt", attempt)
+                        .query(Long.class)
+                        .single()
+                == 1;
+    }
+
+    /**
+     * Takes back every RUNNING job held by a worker that is no longer ALIVE. The attempt
+     * counts against the budget (a job that keeps killing its worker must eventually stop),
+     * so each job goes to PENDING, runnable now, or to DEAD if its budget is spent.
+     *
+     * <p>FOR UPDATE SKIP LOCKED means concurrent reapers split the rows between them, and a
+     * row is re-checked after locking, so each job is reclaimed exactly once.
+     *
+     * @return the new status of each reclaimed job
+     */
+    public List<JobStatus> reclaimFromDeadWorkers() {
+        return jdbc.sql("""
+                        WITH orphaned AS (
+                            SELECT j.id, j.locked_by AS worker_id,
+                                   (j.attempts - j.attempts_excused <= j.max_retries) AS retry
+                            FROM jobs j
+                            JOIN workers w ON w.id = j.locked_by
+                            WHERE j.status = 'RUNNING' AND w.status <> 'ALIVE'
+                            FOR UPDATE OF j SKIP LOCKED
+                        ), done AS (
+                            UPDATE jobs j
+                            SET status = CASE WHEN o.retry THEN 'PENDING' ELSE 'DEAD' END,
+                                run_at = CASE WHEN o.retry THEN now() ELSE j.run_at END,
+                                finished_at = CASE WHEN o.retry THEN NULL ELSE now() END,
+                                last_error = 'Worker ' || CAST(o.worker_id AS text)
+                                             || ' stopped heartbeating; attempt abandoned',
+                                locked_by = NULL, locked_at = NULL, updated_at = now()
+                            FROM orphaned o
+                            WHERE j.id = o.id
+                            RETURNING j.id, j.attempts, j.status, j.last_error
+                        ), closed AS (
+                            UPDATE job_attempts a
+                            SET finished_at = now(), outcome = 'ABANDONED', error = done.last_error
+                            FROM done
+                            WHERE a.job_id = done.id AND a.attempt = done.attempts
+                        )
+                        SELECT status FROM done
+                        """)
+                .query(String.class)
+                .list()
+                .stream()
+                .map(JobStatus::valueOf)
+                .toList();
     }
 
     /** Dead jobs, most recently dead first, keyset-paginated on (finished_at, id). */
