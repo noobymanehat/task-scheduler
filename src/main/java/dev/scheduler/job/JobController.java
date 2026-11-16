@@ -35,8 +35,8 @@ public class JobController {
     }
 
     @GetMapping("/{id}")
-    public JobResponse get(@PathVariable UUID id) {
-        return JobResponse.from(service.get(id));
+    public JobDetailResponse get(@PathVariable UUID id) {
+        return service.getDetail(id);
     }
 
     @GetMapping

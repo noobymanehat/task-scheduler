@@ -47,6 +47,10 @@ public class JobService {
         return jobs.findById(id).orElseThrow(() -> new JobNotFoundException(id));
     }
 
+    public JobDetailResponse getDetail(UUID id) {
+        return new JobDetailResponse(JobResponse.from(get(id)), jobs.findAttempts(id));
+    }
+
     public JobPage list(JobStatus status, String type, int limit, String cursor) {
         int pageSize = Math.clamp(limit, 1, MAX_PAGE_SIZE);
         Cursor after = cursor == null ? null : Cursor.decode(cursor);

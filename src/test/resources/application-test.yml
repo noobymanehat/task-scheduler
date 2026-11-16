@@ -1,0 +1,4 @@
+# Tests construct their own workers; a background worker would claim other tests' jobs.
+scheduler:
+  worker:
+    enabled: false

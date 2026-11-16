@@ -1,6 +1,6 @@
 # Design
 
-Status: **Phases 0-1 complete** (scaffold, submit API; last updated 2026-11-16). Phases 2-6 in §10 are
+Status: **Phases 0-2 complete** (scaffold, submit API, claim + execute; last updated 2026-11-17). Phases 3-6 in §10 are
 designed but not built; this document is updated as each phase lands.
 
 Pinned versions: Java 21, Spring Boot 4.1.2, PostgreSQL 16 (`postgres:16-alpine` in both
@@ -201,18 +201,34 @@ transitions to get wrong.
 ## 5. Claiming and executing
 
 ```sql
-UPDATE jobs
-SET status = 'RUNNING', locked_by = :worker, locked_at = now(),
-    attempts = attempts + 1, updated_at = now()
-WHERE id IN (
+WITH picked AS MATERIALIZED (
     SELECT id FROM jobs
     WHERE status = 'PENDING' AND run_at <= now()
     ORDER BY priority DESC, run_at, id
     LIMIT :free_slots
     FOR UPDATE SKIP LOCKED
+), claimed AS (
+    UPDATE jobs j
+    SET status = 'RUNNING', locked_by = :worker, locked_at = now(),
+        attempts = j.attempts + 1, updated_at = now()
+    FROM picked WHERE j.id = picked.id
+    RETURNING j.*
+), recorded AS (
+    INSERT INTO job_attempts (job_id, attempt, worker_id, started_at)
+    SELECT id, attempts, :worker, now() FROM claimed
 )
-RETURNING *;
+SELECT * FROM claimed ORDER BY priority DESC, run_at, id;
 ```
+
+- **One statement does everything**: lock, transition, and write the `job_attempts` row.
+  It is its own implicit transaction, so a job can never be RUNNING without a history
+  row, and there is no window between "locked" and "marked".
+- **A materialized CTE, not `WHERE id IN (subquery)`**: with `IN`, the planner is free to
+  pick a plan that evaluates the locking subquery more than once, which can lock and
+  update more rows than `LIMIT`. The CTE runs exactly once.
+- **Acks use the same shape**: one statement updates `jobs` under the fencing guard and
+  closes the matching `job_attempts` row; its row count tells the worker whether it
+  still owned the job.
 
 - **`SKIP LOCKED`**: a worker skips rows another worker's in-flight claim has locked
   rather than queueing behind them. Without it, all workers serialise on the head of
@@ -233,7 +249,15 @@ RETURNING *;
 - **Polling**: fixed interval with jitter (default 1s); poll again immediately if the
   last batch was full. `LISTEN/NOTIFY` wake-ups are a possible later optimisation.
 - **Execution**: handlers run on virtual threads bounded by a semaphore
-  (`scheduler.worker.concurrency`). Handlers implement
+  (`scheduler.worker.concurrency`). The poller blocks until at least one permit is
+  free, takes all free permits, claims that many jobs, and returns unused permits; each
+  job releases its permit when its handler thread exits.
+- **Worker failure modes**: a failed claim query is logged and retried on the next poll.
+  If the ack cannot be written (database unreachable), the job stays RUNNING under the
+  worker's id and is recovered by the reaper (§7). `Throwable`, not just `Exception`,
+  is caught around handlers so an `Error` in one job cannot leak a slot.
+- **Phase 2 interim behaviour**: any handler failure sends the job straight to DEAD.
+  Retries with backoff replace this in Phase 3. Handlers implement
   `JobHandler { String type(); void handle(JobContext ctx) throws Exception; }` and are
   discovered as Spring beans. A job with an unknown type fails straight to DEAD.
 
@@ -312,7 +336,7 @@ default every 1s), in one transaction:
 
 ```
 POST   /api/v1/jobs                 submit; 201, or 200 with the existing job on idempotency replay
-GET    /api/v1/jobs/{id}            job + attempt history
+GET    /api/v1/jobs/{id}            job + `attemptHistory` (one entry per claim, oldest first)
 GET    /api/v1/jobs?status=&type=   keyset-paginated list
 POST   /api/v1/jobs/{id}/cancel     409 unless PENDING
 GET    /api/v1/dlq
@@ -410,6 +434,7 @@ approval status.
 | 2026-11-16 | Single artifact, roles by config | Simple build, still scales api and workers independently (§2) |
 | 2026-11-16 | Idempotency replay with a different body returns 409 | Returning the old job would hide a client bug (§9) |
 | 2026-11-16 | Keyset pagination, not OFFSET | Constant cost, stable under inserts (§9) |
+| 2026-11-17 | Claim via a materialized CTE that also inserts the attempt row | `IN (subquery)` can exceed LIMIT under some plans; one statement keeps job and history consistent (§5) |
 | 2026-11-16 | `attempts` is monotonic; budget = `attempts - attempts_excused` | Release and requeue must not reuse an attempt number: it is the `job_attempts` key and the fencing token (§3) |
 | 2026-11-16 | Per-job execution timeout, enforced by the owning worker (Phase 4) | Worker heartbeats cannot see one hung handler; only the owner can interrupt it (§7) |
 | 2026-11-16 | Strict priority, starvation accepted and documented | Aging needs a stored effective priority to keep the claim index usable; deferred (§11) |

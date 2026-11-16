@@ -11,7 +11,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.RepeatedTest;
 import org.springframework.beans.factory.annotation.Autowired;
 
@@ -21,11 +20,6 @@ class JobSubmitConcurrencyTest extends IntegrationTest {
 
     @Autowired
     JobService service;
-
-    @BeforeEach
-    void emptyJobs() {
-        jdbc.sql("TRUNCATE jobs").update();
-    }
 
     /** Twenty threads race to submit the same idempotency key over separate DB connections. */
     @RepeatedTest(5)

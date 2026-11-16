@@ -14,3 +14,12 @@ management:
     web:
       exposure:
         include: health
+
+scheduler:
+  api:
+    enabled: true
+  worker:
+    enabled: true
+    concurrency: 10
+    poll-interval: 1s
+    shutdown-grace: 30s

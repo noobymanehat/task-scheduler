@@ -134,6 +134,95 @@ public class JobRepository {
                 .optional();
     }
 
+    /**
+     * Atomically claims up to {@code limit} due jobs for a worker: PENDING -> RUNNING,
+     * attempts + 1, and one job_attempts row per job, all in a single statement.
+     *
+     * <p>FOR UPDATE SKIP LOCKED makes concurrent claimers pass over each other's rows instead
+     * of blocking on them. The pick is a MATERIALIZED CTE rather than {@code id IN (subquery)}
+     * so the locking subquery runs exactly once and LIMIT is honoured whatever plan is chosen.
+     */
+    public List<Job> claim(UUID workerId, int limit) {
+        return jdbc.sql("""
+                        WITH picked AS MATERIALIZED (
+                            SELECT id FROM jobs
+                            WHERE status = 'PENDING' AND run_at <= now()
+                            ORDER BY priority DESC, run_at, id
+                            LIMIT :limit
+                            FOR UPDATE SKIP LOCKED
+                        ), claimed AS (
+                            UPDATE jobs j
+                            SET status = 'RUNNING', locked_by = :worker, locked_at = now(),
+                                attempts = j.attempts + 1, updated_at = now()
+                            FROM picked
+                            WHERE j.id = picked.id
+                            RETURNING j.*
+                        ), recorded AS (
+                            INSERT INTO job_attempts (job_id, attempt, worker_id, started_at)
+                            SELECT id, attempts, :worker, now() FROM claimed
+                        )
+                        SELECT * FROM claimed ORDER BY priority DESC, run_at, id
+                        """)
+                .param("worker", workerId)
+                .param("limit", limit)
+                .query(jobMapper)
+                .list();
+    }
+
+    /**
+     * RUNNING -> SUCCEEDED, only if {@code workerId} still owns the job on this attempt.
+     * Returns false for a stale ack (the job was reclaimed, or already finished).
+     */
+    public boolean markSucceeded(UUID jobId, UUID workerId, int attempt) {
+        return finish(jobId, workerId, attempt, "SUCCEEDED", "SUCCEEDED", null);
+    }
+
+    /** RUNNING -> DEAD with the same fencing as {@link #markSucceeded}. */
+    public boolean markDead(UUID jobId, UUID workerId, int attempt, String error) {
+        return finish(jobId, workerId, attempt, "DEAD", "FAILED", error);
+    }
+
+    private boolean finish(UUID jobId, UUID workerId, int attempt, String status, String outcome, String error) {
+        return jdbc.sql("""
+                        WITH done AS (
+                            UPDATE jobs
+                            SET status = :status, finished_at = now(), updated_at = now(),
+                                locked_by = NULL, locked_at = NULL,
+                                last_error = COALESCE(CAST(:error AS text), last_error)
+                            WHERE id = :id AND status = 'RUNNING' AND locked_by = :worker AND attempts = :attempt
+                            RETURNING id, attempts
+                        ), closed AS (
+                            UPDATE job_attempts a
+                            SET finished_at = now(), outcome = :outcome, error = CAST(:error AS text)
+                            FROM done
+                            WHERE a.job_id = done.id AND a.attempt = done.attempts
+                        )
+                        SELECT count(*) FROM done
+                        """)
+                        .param("id", jobId)
+                        .param("worker", workerId)
+                        .param("attempt", attempt)
+                        .param("status", status)
+                        .param("outcome", outcome)
+                        .param("error", error)
+                        .query(Long.class)
+                        .single()
+                == 1;
+    }
+
+    public List<JobAttempt> findAttempts(UUID jobId) {
+        return jdbc.sql("SELECT * FROM job_attempts WHERE job_id = :id ORDER BY attempt")
+                .param("id", jobId)
+                .query((rs, n) -> new JobAttempt(
+                        rs.getInt("attempt"),
+                        rs.getObject("worker_id", UUID.class),
+                        instant(rs, "started_at"),
+                        instant(rs, "finished_at"),
+                        rs.getString("outcome"),
+                        rs.getString("error")))
+                .list();
+    }
+
     public record IdempotentMatch(Job job, boolean sameRequest) {}
 
     private static Map<String, Object> submitParams(NewJob job) {
