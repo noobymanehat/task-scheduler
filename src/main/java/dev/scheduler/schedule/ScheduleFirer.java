@@ -1,6 +1,7 @@
 package dev.scheduler.schedule;
 
 import dev.scheduler.job.JobRepository;
+import dev.scheduler.metrics.SchedulerMetrics;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -29,11 +30,18 @@ public class ScheduleFirer implements SmartLifecycle {
     private final JobRepository jobs;
     private final TransactionTemplate tx;
     private final Duration interval;
+    private final SchedulerMetrics metrics;
 
     private volatile boolean running;
     private Thread thread;
 
-    public ScheduleFirer(ScheduleRepository schedules, JobRepository jobs, TransactionTemplate tx, Duration interval) {
+    public ScheduleFirer(
+            ScheduleRepository schedules,
+            JobRepository jobs,
+            TransactionTemplate tx,
+            Duration interval,
+            SchedulerMetrics metrics) {
+        this.metrics = metrics;
         this.schedules = schedules;
         this.jobs = jobs;
         this.tx = tx;
@@ -52,7 +60,10 @@ public class ScheduleFirer implements SmartLifecycle {
             }
             return created;
         });
-        return fired == null ? 0 : fired;
+        int count = fired == null ? 0 : fired;
+        // Counted only after the transaction committed.
+        metrics.schedulesFired(count);
+        return count;
     }
 
     private boolean fire(Schedule schedule, Instant now) {

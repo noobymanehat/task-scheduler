@@ -8,12 +8,16 @@ spring:
   threads:
     virtual:
       enabled: true
+  lifecycle:
+    # Must exceed scheduler.worker.shutdown-grace: otherwise Spring gives up on the worker's
+    # stop() and closes the connection pool before unfinished jobs can be released.
+    timeout-per-shutdown-phase: 45s
 
 management:
   endpoints:
     web:
       exposure:
-        include: health
+        include: health,prometheus
 
 scheduler:
   api:
@@ -31,3 +35,7 @@ scheduler:
       max-delay: 1h
   schedule:
     poll-interval: 1s
+  metrics:
+    refresh-interval: 5s
+  demo-handlers:
+    enabled: true

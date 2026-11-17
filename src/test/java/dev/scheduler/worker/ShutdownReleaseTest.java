@@ -74,6 +74,35 @@ class ShutdownReleaseTest extends WorkerTestSupport {
         assertThat(history).extracting(JobAttempt::outcome).containsExactly("RELEASED", "FAILED", "SUCCEEDED");
     }
 
+    /**
+     * The grace period here is several heartbeat timeouts long. A worker that stopped
+     * heartbeating when shutdown began would be declared dead while draining: its job would
+     * be charged as ABANDONED (and, with max_retries = 0, dead-lettered) instead of released.
+     */
+    @Test
+    void drainingWorkerKeepsHeartbeatingSoItIsNotReapedDuringTheGracePeriod() throws Exception {
+        var started = new CountDownLatch(1);
+        Job job = submitWithMaxRetries("work", 0);
+        Worker worker = startWorker(props(1, Duration.ofSeconds(1)), TestHandlers.of("work", ctx -> {
+            started.countDown();
+            new CountDownLatch(1).await();
+        }));
+        assertThat(started.await(30, TimeUnit.SECONDS)).isTrue();
+        UUID workerId = worker.id();
+        Reaper reaper = reaper(Duration.ofMillis(250));
+
+        Thread stopping = Thread.ofPlatform().start(worker::stop);
+        await().atMost(TIMEOUT).pollInterval(Duration.ofMillis(20)).until(() -> {
+            assertThat(reaper.reapOnce()).isEqualTo(new Reaper.ReapResult(0, 0, 0));
+            return !stopping.isAlive();
+        });
+
+        assertThat(workerStatus(workerId)).isEqualTo("STOPPED");
+        assertThat(reload(job).status()).isEqualTo(JobStatus.PENDING);
+        assertThat(reload(job).attemptsExcused()).isEqualTo(1);
+        assertThat(jobs.findAttempts(job.id())).extracting(JobAttempt::outcome).containsExactly("RELEASED");
+    }
+
     @Test
     void releaseIsFencedLikeAnAck() {
         UUID owner = registeredWorkerId();

@@ -4,6 +4,8 @@ import dev.scheduler.IntegrationTest;
 import dev.scheduler.job.Job;
 import dev.scheduler.job.JobRepository;
 import dev.scheduler.job.NewJob;
+import dev.scheduler.metrics.SchedulerMetrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -21,6 +23,11 @@ abstract class WorkerTestSupport extends IntegrationTest {
 
     @Autowired
     protected WorkerRepository workers;
+
+    /** A private registry per test, so metric assertions see only this test's activity. */
+    protected final SimpleMeterRegistry meters = new SimpleMeterRegistry();
+
+    protected final SchedulerMetrics metrics = new SchedulerMetrics(meters);
 
     private final List<Worker> started = new ArrayList<>();
 
@@ -55,7 +62,7 @@ abstract class WorkerTestSupport extends IntegrationTest {
     }
 
     protected Worker startWorker(WorkerProperties properties, JobHandler... handlers) {
-        var worker = new Worker(jobs, workers, new HandlerRegistry(List.of(handlers)), properties);
+        var worker = new Worker(jobs, workers, new HandlerRegistry(List.of(handlers)), properties, metrics);
         worker.start();
         started.add(worker);
         return worker;
@@ -63,7 +70,7 @@ abstract class WorkerTestSupport extends IntegrationTest {
 
     /** A reaper that is not running on a schedule; tests call {@code reapOnce()}. */
     protected Reaper reaper(Duration heartbeatTimeout) {
-        return new Reaper(workers, jobs, heartbeatTimeout, Duration.ofHours(1));
+        return new Reaper(workers, jobs, heartbeatTimeout, Duration.ofHours(1), metrics);
     }
 
     /** Makes a worker look as if it last heartbeated an hour ago. */

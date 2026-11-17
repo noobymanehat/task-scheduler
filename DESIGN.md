@@ -1,7 +1,7 @@
 # Design
 
-Status: **Phases 0-5 complete** (scaffold, submit API, claim + execute, retries + DLQ, crash recovery + timeouts, cron schedules; last updated 2026-11-17). Phase 6 in §10 is
-designed but not built; this document is updated as each phase lands.
+Status: **All phases (0-6) complete** (scaffold, submit API, claim + execute, retries + DLQ,
+crash recovery + timeouts, cron schedules, metrics + packaging; last updated 2026-11-17).
 
 Pinned versions: Java 21, Spring Boot 4.1.2, PostgreSQL 16 (`postgres:16-alpine` in both
 `compose.yaml` and the Testcontainers config, so tests run against what Compose runs).
@@ -38,8 +38,10 @@ transaction, and we say so rather than pretend.
 - `FOR UPDATE SKIP LOCKED` gives contention-free multi-consumer claiming.
 - Scheduled (`run_at`), prioritised, queryable, cancellable jobs are just SQL; brokers
   are poor at "run this in 3 hours" and "show me everything that failed".
-- One dependency to operate. The trade-off is throughput: this design tops out in the
-  low thousands of jobs/sec, which is far beyond what most systems need.
+- One dependency to operate. The trade-off is throughput: every job costs at least two
+  row updates in one database. Measured: about 11,500 no-op jobs/s with 3 workers
+  (30 slots) on an 8-core laptop that also hosts Postgres (`scripts/benchmark.sh`, see
+  README), which is far beyond what most systems need but well short of a log-based broker.
 
 ## 2. Process model
 
@@ -358,7 +360,7 @@ interrupts the handler's virtual thread.
   job has been failed and possibly retried (another reason handlers must be idempotent).
   Its executor slot is only freed when the thread actually exits, so a stuck handler
   shows up as lost capacity (`Worker.stuckHandlers()`, exported as the
-  `jobs.handlers.stuck` gauge in Phase 6) rather than as unbounded thread growth.
+  `jobs.handlers.stuck` gauge) rather than as unbounded thread growth.
 
 ### One writer per execution
 Four parties can end a running execution: the handler returning, the timeout watchdog,
@@ -370,11 +372,27 @@ source of clean logs; correctness across processes still rests on the SQL fencin
 ### Graceful shutdown
 On SIGTERM: stop polling, wait up to `shutdown-grace` for in-flight jobs, then release
 anything unfinished back to PENDING *without* consuming retry budget, interrupt those
-handlers, and mark the worker STOPPED. The heartbeat keeps running until the end so a
-draining worker is not reaped. Rolling deploys therefore do not burn retries. Release
+handlers, and mark the worker STOPPED. Rolling deploys therefore do not burn retries. Release
 keeps `attempts` as is and does `attempts_excused + 1`, closing the `job_attempts` row
 as RELEASED; the next claim gets a fresh attempt number (§3). `run_at` is untouched, so
 another worker can pick the job up immediately.
+
+- **The heartbeat outlives polling.** The heartbeat thread has its own flag and stops only
+  after the release, just before the worker is marked STOPPED. Otherwise a worker that
+  drains for longer than `heartbeat-timeout` is reaped mid-drain: its jobs are charged as
+  ABANDONED (a `max_retries = 0` job is dead-lettered) and its own release then matches
+  no rows.
+- **Three timeouts must be ordered**: `shutdown-grace` (30s) <
+  container stop timeout (`stop_grace_period: 40s` in Compose) and
+  `shutdown-grace` < `spring.lifecycle.timeout-per-shutdown-phase` (45s; Spring's default
+  of 30s equals the grace, and when it expires Spring stops waiting for `stop()` and goes
+  on to close the connection pool). `stop()` normally returns within the grace plus about
+  a second.
+- Both points were found in Phase 6 by `docker stop` on a real container: the first
+  version stopped heartbeating as soon as shutdown began, and the in-JVM test did not
+  notice because its grace period was shorter than its heartbeat timeout. Now covered by
+  `ShutdownReleaseTest` (a reaper runs throughout a drain several heartbeat timeouts
+  long) and by the smoke test's `docker stop` step.
 
 ## 8. Recurring cron schedules
 
@@ -455,16 +473,40 @@ pages do not shift when new jobs are inserted mid-scan.
 [-1000, 1000]; `maxRetries` in [0, 25]; `timeoutSeconds` in [1, 86400];
 `idempotencyKey` 1-255 chars. A `runAt` in the past is accepted and means "now".
 
-**Metrics** (Micrometer):
-- Counters: `jobs.submitted`, `jobs.claimed`, `jobs.succeeded`, `jobs.failed`,
-  `jobs.retried`, `jobs.dead`, `jobs.reclaimed`, `jobs.timed_out`, `jobs.released`,
-  `schedules.fired` (tagged by job type)
-- Timers: `job.execution.duration`, `job.queue.wait` (claim time − `run_at`), `claim.query.duration`
-- Gauges (from a periodically cached `GROUP BY status` query): `jobs.queue.depth{status}`,
-  `jobs.oldest.pending.age`, `workers.alive`, `jobs.handlers.stuck`
+**Metrics** (Micrometer, Prometheus format at `/actuator/prometheus`; names below are
+Micrometer's, Prometheus renders `jobs.submitted` as `jobs_submitted_total` and so on):
+- Counters tagged `type`: `jobs.submitted`, `jobs.claimed`, `jobs.succeeded`,
+  `jobs.failed`, `jobs.timed_out`, `jobs.retried`, `jobs.dead`, `jobs.released`.
+  A failure or timeout also counts as exactly one of `retried` / `dead`.
+- Other counters: `jobs.reclaimed{result=requeued|dead}` (reaper), `schedules.fired`.
+- Timers: `job.execution.duration{type,outcome}`, `job.queue.wait{type}` (claim time −
+  `run_at`, both read from the claimed row), `claim.query.duration`.
+- Gauges: `jobs.queue.depth{state=ready|scheduled|running|dead}`,
+  `jobs.oldest.pending.age` (seconds, oldest *ready* job), `workers.alive`,
+  `jobs.handlers.stuck`.
+
+Notes:
+- A counter moves only when its guarded `UPDATE` matched a row, so a result discarded by
+  fencing is not counted as a success or failure.
+- The `type` tag is bounded: job types come from registered handlers, not from callers.
+  (`jobs.submitted` is the exception, since the API accepts any well-formed type.)
+- Queue gauges come from one query, cached for `scheduler.metrics.refresh-interval`
+  (5s), so a scrape costs at most one query. It counts only active states, each through
+  a partial index (`jobs_claim_idx`, `jobs_running_idx`, `jobs_dead_idx`,
+  `workers_alive_idx`), so its cost follows the live queue, not the history. If the query
+  fails, the previous values are reported rather than failing the scrape.
+- Counters and timers are per process (the API counts submissions, each worker its own
+  executions); gauges are read from the database and agree across instances.
+  Aggregation is left to Prometheus, which the Compose stack does not include.
 
 Queue wait time and oldest-pending age are the metrics that matter operationally: they
 say whether the fleet is keeping up, which raw counts do not.
+
+**Packaging**: a two-stage `Dockerfile` (JDK build, JRE runtime, non-root, exec-form
+entrypoint so the JVM receives SIGTERM). `compose.yaml` runs Postgres, one API and three
+workers from that image, with heartbeat timings shortened (2s / 10s / 3s) so a killed
+worker is detected in seconds. The `demo.*` handlers (`scheduler.demo-handlers.enabled`)
+exist for the README demos, the smoke test and the benchmark.
 
 ## 10. Build plan
 
@@ -479,7 +521,7 @@ approval status.
 | 3 | Retries + DLQ | backoff with jitter, DEAD state, non-retryable errors, DLQ endpoints | backoff bounds per attempt; job dies after max_retries+1 counted attempts; requeue grants a fresh budget and the next attempt number continues (no `job_attempts` collision); unknown type goes DEAD |
 | 4 | Heartbeat + reclaim + timeout | heartbeat thread, reaper, self-fencing, graceful shutdown, per-job execution timeout | kill a worker mid-job, another worker completes it; concurrent reapers reclaim once; zombie worker's late ack ignored; poison job ends in DLQ; shutdown release excuses the attempt and the re-claim gets a new attempt number; hung handler is interrupted, recorded TIMED_OUT, retried, and dies after budget; interrupt-ignoring handler's late ack rejected |
 | 5 | Cron | `schedules` table, firing loop, CRUD, pause/resume | 4 firers, one job per tick; misfire fires once; pause stops firing; timezone handling; invalid cron rejected |
-| 6 | Metrics + packaging | Micrometer metrics, Dockerfile, Compose with scaled workers, README with a crash-recovery demo and a throughput number | metrics reflect a known workload; Compose smoke test script |
+| 6 | Metrics + packaging | Micrometer metrics, Dockerfile, Compose with scaled workers, README with a crash-recovery demo and a throughput number | metrics reflect a known workload (counters, timers, gauges, Prometheus scrape); `scripts/smoke-test.sh` against real containers: 200 jobs over 3 workers with one attempt each, flaky job retried to success, `docker kill` recovery, `docker stop` release; draining worker is not reaped |
 
 ## 11. Known limitations
 
@@ -531,6 +573,11 @@ approval status.
 | 2026-11-17 | One transaction per firing pass (lock, insert job, advance) | A tick can be neither lost nor repeated by a crash mid-pass (§8) |
 | 2026-11-17 | Scheduled job's `run_at` is the nominal tick time | Lateness after a misfire shows up in queue-wait metrics (§8) |
 | 2026-11-17 | Tests share one Postgres container across Spring contexts | Faster, and fewer container startups to fail; wired by properties because Boot stops container beans with their context |
+| 2026-11-17 | Heartbeat runs until the worker is marked STOPPED, on its own flag | A worker draining for longer than the heartbeat timeout was reaped and its jobs charged as abandoned (§7) |
+| 2026-11-17 | Spring shutdown-phase timeout (45s) and container stop timeout (40s) both exceed `shutdown-grace` (30s) | Otherwise the pool closes or the container is killed before unfinished jobs are released (§7) |
+| 2026-11-17 | Queue gauges from one cached query over active states only | A scrape costs at most one query, served by partial indexes (§9) |
+| 2026-11-17 | Metrics are per process; no Prometheus in Compose | Aggregation belongs to the scraper; keeps the stack to one dependency (§9) |
+| 2026-11-17 | Throughput claim replaced by a measurement | ~11,500 no-op jobs/s, 3 workers, one laptop; reproducible with `scripts/benchmark.sh` (§1) |
 | 2026-11-16 | `attempts` is monotonic; budget = `attempts - attempts_excused` | Release and requeue must not reuse an attempt number: it is the `job_attempts` key and the fencing token (§3) |
 | 2026-11-16 | Per-job execution timeout, enforced by the owning worker (Phase 4) | Worker heartbeats cannot see one hung handler; only the owner can interrupt it (§7) |
 | 2026-11-16 | Strict priority, starvation accepted and documented | Aging needs a stored effective priority to keep the claim index usable; deferred (§11) |

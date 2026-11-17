@@ -2,8 +2,12 @@ package dev.scheduler.worker;
 
 import dev.scheduler.job.Job;
 import dev.scheduler.job.JobRepository;
+import dev.scheduler.job.JobStatus;
+import dev.scheduler.metrics.SchedulerMetrics;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.time.Duration;
+import java.util.Optional;
 import java.util.List;
 import java.util.Random;
 import java.util.Set;
@@ -75,6 +79,7 @@ public class Worker implements SmartLifecycle {
     private final WorkerProperties properties;
     private final Semaphore slots;
     private final BackoffPolicy backoff;
+    private final SchedulerMetrics metrics;
     private final Set<Execution> inFlight = ConcurrentHashMap.newKeySet();
     private final AtomicInteger stuckHandlers = new AtomicInteger();
     private final ExecutorService executor =
@@ -84,10 +89,19 @@ public class Worker implements SmartLifecycle {
 
     private volatile UUID id = UUID.randomUUID();
     private volatile boolean running;
+    /** Outlives {@code running}: a draining worker must keep heartbeating or it is reaped mid-drain. */
+    private volatile boolean heartbeating;
     private Thread poller;
     private Thread heartbeat;
 
-    public Worker(JobRepository jobs, WorkerRepository workers, HandlerRegistry handlers, WorkerProperties properties) {
+    public Worker(
+            JobRepository jobs,
+            WorkerRepository workers,
+            HandlerRegistry handlers,
+            WorkerProperties properties,
+            SchedulerMetrics metrics) {
+        this.metrics = metrics;
+        metrics.trackStuckHandlers(stuckHandlers::get);
         this.jobs = jobs;
         this.workers = workers;
         this.handlers = handlers;
@@ -115,6 +129,7 @@ public class Worker implements SmartLifecycle {
         running = true;
         String shortId = id.toString().substring(0, 8);
         // A dedicated platform thread: heartbeats must not queue behind job execution.
+        heartbeating = true;
         heartbeat = Thread.ofPlatform().name("worker-heartbeat-" + shortId).daemon(true).start(this::heartbeatLoop);
         poller = Thread.ofPlatform().name("worker-poller-" + shortId).daemon(true).start(this::pollLoop);
         log.info("Worker {} started (concurrency={}, pollInterval={})",
@@ -145,6 +160,7 @@ public class Worker implements SmartLifecycle {
             Thread.currentThread().interrupt();
         }
         timeoutTimer.shutdownNow();
+        heartbeating = false;
         heartbeat.interrupt();
         try {
             heartbeat.join(1_000);
@@ -204,13 +220,14 @@ public class Worker implements SmartLifecycle {
         UUID claimingAs = id;
         List<Job> claimed;
         try {
-            claimed = jobs.claim(claimingAs, free);
+            claimed = metrics.timeClaim(() -> jobs.claim(claimingAs, free));
         } catch (RuntimeException e) {
             slots.release(free);
             throw e;
         }
         slots.release(free - claimed.size());
         for (Job job : claimed) {
+            metrics.claimed(job);
             var execution = new Execution(job, claimingAs);
             inFlight.add(execution);
             executor.execute(() -> {
@@ -228,18 +245,19 @@ public class Worker implements SmartLifecycle {
 
     // ---- execution ----
 
-    private void run(Execution execution) {
-        Job job = execution.job;
-        execution.thread = Thread.currentThread();
-        if (execution.state.get() != State.RUNNING) {
+    private void run(Execution run) {
+        Job job = run.job;
+        run.thread = Thread.currentThread();
+        if (run.state.get() != State.RUNNING) {
             return; // released or abandoned before the handler started
         }
         ScheduledFuture<?> watchdog = timeoutTimer.schedule(
                 // The timer thread only dispatches; the database write happens off it.
-                () -> Thread.startVirtualThread(() -> timeOut(execution)), job.timeoutSeconds(), TimeUnit.SECONDS);
+                () -> Thread.startVirtualThread(() -> timeOut(run)), job.timeoutSeconds(), TimeUnit.SECONDS);
 
         String error = null;
         boolean retryable = true;
+        long startedNanos = System.nanoTime();
         try {
             var handler = handlers.find(job.type());
             if (handler.isEmpty()) {
@@ -257,10 +275,11 @@ public class Worker implements SmartLifecycle {
         } finally {
             watchdog.cancel(false);
         }
+        Duration execution = Duration.ofNanos(System.nanoTime() - startedNanos);
 
-        if (!execution.state.compareAndSet(State.RUNNING, State.FINISHED)) {
+        if (!run.state.compareAndSet(State.RUNNING, State.FINISHED)) {
             // Someone else already settled this attempt; its result must not be written.
-            State settledAs = execution.state.get();
+            State settledAs = run.state.get();
             if (settledAs == State.TIMED_OUT) {
                 stuckHandlers.decrementAndGet();
             }
@@ -272,20 +291,24 @@ public class Worker implements SmartLifecycle {
             // Fenced by (worker, attempt): a stale result means this attempt no longer owns the job.
             boolean recorded;
             if (error == null) {
-                recorded = jobs.markSucceeded(job.id(), execution.workerId, job.attempts());
+                recorded = jobs.markSucceeded(job.id(), run.workerId, job.attempts());
+                if (recorded) {
+                    metrics.succeeded(job.type(), execution);
+                }
             } else {
-                recorded = jobs.markFailed(
-                                job.id(), execution.workerId, job.attempts(), error, retryable, nextDelay(job))
-                        .isPresent();
+                Optional<JobStatus> next =
+                        jobs.markFailed(job.id(), run.workerId, job.attempts(), error, retryable, nextDelay(job));
+                next.ifPresent(status -> metrics.failed(job.type(), execution, status == JobStatus.DEAD));
+                recorded = next.isPresent();
             }
             if (!recorded) {
                 log.warn("Worker {} discarded the result of job {} attempt {}: no longer the owner",
-                        execution.workerId, job.id(), job.attempts());
+                        run.workerId, job.id(), job.attempts());
             }
         } catch (RuntimeException e) {
             // The job stays RUNNING under this worker's name until crash recovery reclaims it.
             log.error("Worker {} could not record the outcome of job {} attempt {}",
-                    execution.workerId, job.id(), job.attempts(), e);
+                    run.workerId, job.id(), job.attempts(), e);
         }
     }
 
@@ -303,11 +326,12 @@ public class Worker implements SmartLifecycle {
         log.warn("Job {} attempt {} exceeded its {}s timeout", job.id(), job.attempts(), job.timeoutSeconds());
         try {
             jobs.markTimedOut(
-                    job.id(),
-                    execution.workerId,
-                    job.attempts(),
-                    "Timed out after " + job.timeoutSeconds() + "s",
-                    nextDelay(job));
+                            job.id(),
+                            execution.workerId,
+                            job.attempts(),
+                            "Timed out after " + job.timeoutSeconds() + "s",
+                            nextDelay(job))
+                    .ifPresent(status -> metrics.timedOut(job.type(), status == JobStatus.DEAD));
         } catch (RuntimeException e) {
             log.error("Worker {} could not record the timeout of job {} attempt {}",
                     execution.workerId, job.id(), job.attempts(), e);
@@ -323,8 +347,13 @@ public class Worker implements SmartLifecycle {
             }
             Job job = execution.job;
             try {
-                jobs.release(job.id(), execution.workerId, job.attempts());
-                log.info("Worker {} released job {} attempt {} at shutdown", id, job.id(), job.attempts());
+                if (jobs.release(job.id(), execution.workerId, job.attempts())) {
+                    metrics.released(job.type());
+                    log.info("Worker {} released job {} attempt {} at shutdown", id, job.id(), job.attempts());
+                } else {
+                    log.warn("Worker {} could not release job {} attempt {} at shutdown: no longer the owner",
+                            id, job.id(), job.attempts());
+                }
             } catch (RuntimeException e) {
                 log.error("Worker {} could not release job {}; the reaper will reclaim it", id, job.id(), e);
             }
@@ -335,7 +364,7 @@ public class Worker implements SmartLifecycle {
     // ---- heartbeat and self-fencing ----
 
     private void heartbeatLoop() {
-        while (running) {
+        while (heartbeating) {
             try {
                 Thread.sleep(properties.heartbeatInterval().toMillis());
                 if (!workers.heartbeat(id)) {
@@ -371,7 +400,7 @@ public class Worker implements SmartLifecycle {
 
     // ---- helpers ----
 
-    private java.time.Duration nextDelay(Job job) {
+    private Duration nextDelay(Job job) {
         return backoff.delay(job.attempts() - job.attemptsExcused());
     }
 

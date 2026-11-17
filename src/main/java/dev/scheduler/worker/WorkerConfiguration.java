@@ -1,6 +1,7 @@
 package dev.scheduler.worker;
 
 import dev.scheduler.job.JobRepository;
+import dev.scheduler.metrics.SchedulerMetrics;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -19,13 +20,19 @@ public class WorkerConfiguration {
     /** Started and stopped with the application context via {@code SmartLifecycle}. */
     @Bean
     @ConditionalOnProperty(prefix = "scheduler.worker", name = "enabled", matchIfMissing = true)
-    Worker worker(JobRepository jobs, WorkerRepository workers, HandlerRegistry handlers, WorkerProperties properties) {
-        return new Worker(jobs, workers, handlers, properties);
+    Worker worker(
+            JobRepository jobs,
+            WorkerRepository workers,
+            HandlerRegistry handlers,
+            WorkerProperties properties,
+            SchedulerMetrics metrics) {
+        return new Worker(jobs, workers, handlers, properties, metrics);
     }
 
     @Bean
     @ConditionalOnProperty(prefix = "scheduler.worker", name = "enabled", matchIfMissing = true)
-    Reaper reaper(WorkerRepository workers, JobRepository jobs, WorkerProperties properties) {
-        return new Reaper(workers, jobs, properties.heartbeatTimeout(), properties.reaperInterval());
+    Reaper reaper(
+            WorkerRepository workers, JobRepository jobs, WorkerProperties properties, SchedulerMetrics metrics) {
+        return new Reaper(workers, jobs, properties.heartbeatTimeout(), properties.reaperInterval(), metrics);
     }
 }

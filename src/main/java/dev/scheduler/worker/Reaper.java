@@ -2,6 +2,7 @@ package dev.scheduler.worker;
 
 import dev.scheduler.job.JobRepository;
 import dev.scheduler.job.JobStatus;
+import dev.scheduler.metrics.SchedulerMetrics;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
@@ -24,11 +25,18 @@ public class Reaper implements SmartLifecycle {
     private final JobRepository jobs;
     private final Duration heartbeatTimeout;
     private final Duration interval;
+    private final SchedulerMetrics metrics;
 
     private volatile boolean running;
     private Thread thread;
 
-    public Reaper(WorkerRepository workers, JobRepository jobs, Duration heartbeatTimeout, Duration interval) {
+    public Reaper(
+            WorkerRepository workers,
+            JobRepository jobs,
+            Duration heartbeatTimeout,
+            Duration interval,
+            SchedulerMetrics metrics) {
+        this.metrics = metrics;
         this.workers = workers;
         this.jobs = jobs;
         this.heartbeatTimeout = heartbeatTimeout;
@@ -48,6 +56,7 @@ public class Reaper implements SmartLifecycle {
         List<JobStatus> reclaimed = jobs.reclaimFromDeadWorkers();
         int requeued = (int) reclaimed.stream().filter(s -> s == JobStatus.PENDING).count();
         var result = new ReapResult(markedDead, requeued, reclaimed.size() - requeued);
+        metrics.reclaimed(result.jobsRequeued(), result.jobsDead());
         if (markedDead > 0 || !reclaimed.isEmpty()) {
             log.warn("Reaper: {} worker(s) declared dead, {} job(s) requeued, {} job(s) dead-lettered",
                     result.workersMarkedDead(), result.jobsRequeued(), result.jobsDead());

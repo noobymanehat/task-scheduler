@@ -8,6 +8,8 @@ import dev.scheduler.job.Job;
 import dev.scheduler.job.JobRepository;
 import dev.scheduler.job.JobStatus;
 import dev.scheduler.job.NewJob;
+import dev.scheduler.metrics.SchedulerMetrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -44,6 +46,8 @@ class ScheduleFiringTest extends IntegrationTest {
     @Autowired
     JsonMapper json;
 
+    private final SimpleMeterRegistry meters = new SimpleMeterRegistry();
+    private final SchedulerMetrics metrics = new SchedulerMetrics(meters);
     private final List<ScheduleFirer> started = new ArrayList<>();
 
     @AfterEach
@@ -107,6 +111,7 @@ class ScheduleFiringTest extends IntegrationTest {
         assertThat(firer().fireDue()).isEqualTo(1);
 
         assertThat(jobsOf(schedule)).hasSize(1);
+        assertThat(meters.counter("schedules.fired").count()).isEqualTo(1.0);
         Instant next = reload(schedule).nextFireAt();
         assertThat(next).isAfter(before).isBeforeOrEqualTo(before.plusSeconds(61));
     }
@@ -253,7 +258,7 @@ class ScheduleFiringTest extends IntegrationTest {
     void runningFirersFireAnEverySecondScheduleOncePerSecond() {
         Schedule schedule = create("ticker", EVERY_SECOND);
         for (int i = 0; i < 2; i++) {
-            var firer = new ScheduleFirer(schedules, jobs, tx, Duration.ofMillis(20));
+            var firer = new ScheduleFirer(schedules, jobs, tx, Duration.ofMillis(20), metrics);
             firer.start();
             started.add(firer);
         }
@@ -273,7 +278,7 @@ class ScheduleFiringTest extends IntegrationTest {
     // ---- helpers ----
 
     private ScheduleFirer firer() {
-        return new ScheduleFirer(schedules, jobs, tx, Duration.ofHours(1));
+        return new ScheduleFirer(schedules, jobs, tx, Duration.ofHours(1), metrics);
     }
 
     private Schedule create(String name, String cron) {

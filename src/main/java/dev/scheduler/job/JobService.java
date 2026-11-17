@@ -1,5 +1,6 @@
 package dev.scheduler.job;
 
+import dev.scheduler.metrics.SchedulerMetrics;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
@@ -18,9 +19,11 @@ public class JobService {
     static final int MAX_PAGE_SIZE = 200;
 
     private final JobRepository jobs;
+    private final SchedulerMetrics metrics;
 
-    public JobService(JobRepository jobs) {
+    public JobService(JobRepository jobs, SchedulerMetrics metrics) {
         this.jobs = jobs;
+        this.metrics = metrics;
     }
 
     /**
@@ -32,6 +35,7 @@ public class JobService {
         NewJob newJob = toNewJob(request);
         var inserted = jobs.insert(newJob);
         if (inserted.isPresent()) {
+            metrics.submitted(newJob.type());
             return new Submission(inserted.get(), true);
         }
         var existing = jobs.findByIdempotencyKey(newJob)

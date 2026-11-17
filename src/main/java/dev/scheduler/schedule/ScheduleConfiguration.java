@@ -1,6 +1,7 @@
 package dev.scheduler.schedule;
 
 import dev.scheduler.job.JobRepository;
+import dev.scheduler.metrics.SchedulerMetrics;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -15,7 +16,11 @@ public class ScheduleConfiguration {
     @Bean
     @ConditionalOnProperty(prefix = "scheduler.worker", name = "enabled", matchIfMissing = true)
     ScheduleFirer scheduleFirer(
-            ScheduleRepository schedules, JobRepository jobs, TransactionTemplate tx, ScheduleProperties properties) {
-        return new ScheduleFirer(schedules, jobs, tx, properties.pollInterval());
+            ScheduleRepository schedules,
+            JobRepository jobs,
+            TransactionTemplate tx,
+            ScheduleProperties properties,
+            SchedulerMetrics metrics) {
+        return new ScheduleFirer(schedules, jobs, tx, properties.pollInterval(), metrics);
     }
 }

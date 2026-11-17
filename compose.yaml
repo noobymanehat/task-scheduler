@@ -1,4 +1,22 @@
-# Local development database. API and worker containers are added in Phase 6.
+# The full stack: Postgres, one API instance, and a pool of workers from the same image.
+#
+#   docker compose up --build              # 3 workers
+#   docker compose up --build --scale worker=5
+#   docker compose up postgres             # database only, for running the app from an IDE
+#
+# Heartbeat settings are shortened so the crash-recovery demo in the README takes seconds;
+# the application defaults (5s / 30s / 10s) are more conservative.
+x-app: &app
+  build: .
+  image: task-scheduler:local
+  depends_on:
+    postgres:
+      condition: service_healthy
+  environment: &app-env
+    DB_URL: jdbc:postgresql://postgres:5432/scheduler
+    DB_USER: scheduler
+    DB_PASSWORD: scheduler
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -15,6 +33,30 @@ services:
       interval: 2s
       timeout: 2s
       retries: 15
+
+  api:
+    <<: *app
+    environment:
+      <<: *app-env
+      SCHEDULER_API_ENABLED: "true"
+      SCHEDULER_WORKER_ENABLED: "false"
+    ports:
+      - "8080:8080"
+
+  worker:
+    <<: *app
+    environment:
+      <<: *app-env
+      SCHEDULER_API_ENABLED: "false"
+      SCHEDULER_WORKER_ENABLED: "true"
+      SCHEDULER_WORKER_CONCURRENCY: "10"
+      SCHEDULER_WORKER_HEARTBEAT_INTERVAL: 2s
+      SCHEDULER_WORKER_HEARTBEAT_TIMEOUT: 10s
+      SCHEDULER_WORKER_REAPER_INTERVAL: 3s
+    deploy:
+      replicas: 3
+    # Longer than scheduler.worker.shutdown-grace (30s), so in-flight jobs can drain or be released.
+    stop_grace_period: 40s
 
 volumes:
   pgdata:
