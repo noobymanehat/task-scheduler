@@ -14,7 +14,8 @@ and clear design reasoning, not feature breadth.
 - Metrics endpoint (Micrometer / Prometheus).
 - Delivery guarantee: **at-least-once**. Handlers must be idempotent.
 
-Non-goals: a message broker, multi-tenant auth, a UI, workflow/DAG dependencies, sharding.
+Non-goals: a message broker, multi-tenant auth, a product UI (the single dependency-free
+admin page for demos and debugging is the exception), workflow/DAG dependencies, sharding.
 
 ## Stack
 
@@ -22,7 +23,8 @@ Non-goals: a message broker, multi-tenant auth, a UI, workflow/DAG dependencies,
 - PostgreSQL 16, Flyway migrations
 - Spring `JdbcClient` with hand-written SQL (no JPA: the SQL is the interesting part)
 - JUnit 5, AssertJ, Testcontainers (real Postgres, never H2), Awaitility
-- Docker Compose: postgres + 1 api + N workers from one image
+- Docker Compose: postgres + 1 api + N workers from one image, plus Prometheus and Grafana
+- Admin UI: plain HTML/CSS/JS under `src/main/resources/admin-ui`, no framework or build step
 
 ## Documents
 
@@ -30,7 +32,7 @@ Non-goals: a message broker, multi-tenant auth, a UI, workflow/DAG dependencies,
   reasoning behind decisions. **Update it in the same change as any code that alters
   the schema, the state machine, a guarantee, or a decision recorded there.** New
   decisions get an entry in its decision log.
-- Work follows the phased plan in `DESIGN.md` §10. Do not start a phase before the
+- Work follows the phased plan in `DESIGN.md` §11. Do not start a phase before the
   previous one's tests pass and the user has approved moving on.
 
 ## Conventions

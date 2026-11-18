@@ -19,7 +19,9 @@ public class QueueStats {
 
     private static final Logger log = LoggerFactory.getLogger(QueueStats.class);
 
-    record Snapshot(long ready, long scheduled, long running, long dead, double oldestReadySeconds, long workersAlive) {}
+    /** Counts of the active job states and live workers, read in one query. */
+    public record Snapshot(
+            long ready, long scheduled, long running, long dead, double oldestReadySeconds, long workersAlive) {}
 
     private final JdbcClient jdbc;
     private final long refreshNanos;
@@ -59,7 +61,7 @@ public class QueueStats {
         long now = System.nanoTime();
         if (!loaded || now - loadedAt >= refreshNanos) {
             try {
-                snapshot = load();
+                snapshot = read();
             } catch (RuntimeException e) {
                 // A scrape must not fail because the database is briefly unreachable.
                 log.warn("Could not refresh queue statistics; reporting the previous values", e);
@@ -70,7 +72,8 @@ public class QueueStats {
         return snapshot;
     }
 
-    private Snapshot load() {
+    /** Reads the current values, bypassing the cache that the gauges use. */
+    public Snapshot read() {
         return jdbc.sql("""
                         SELECT
                           (SELECT count(*) FROM jobs WHERE status = 'PENDING' AND run_at <= now()) AS ready,

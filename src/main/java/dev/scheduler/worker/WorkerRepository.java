@@ -65,6 +65,7 @@ public class WorkerRepository {
     public List<WorkerInfo> list(String status, int limit) {
         return jdbc.sql("""
                         SELECT w.*,
+                               extract(epoch FROM now() - w.last_heartbeat_at) AS heartbeat_age_seconds,
                                (SELECT count(*) FROM jobs j
                                 WHERE j.locked_by = w.id AND j.status = 'RUNNING') AS running_jobs
                         FROM workers w
@@ -80,6 +81,7 @@ public class WorkerRepository {
                         rs.getString("status"),
                         rs.getObject("started_at", OffsetDateTime.class).toInstant(),
                         rs.getObject("last_heartbeat_at", OffsetDateTime.class).toInstant(),
+                        rs.getDouble("heartbeat_age_seconds"),
                         rs.getLong("running_jobs")))
                 .list();
     }

@@ -1,7 +1,8 @@
 # Design
 
-Status: **All phases (0-6) complete** (scaffold, submit API, claim + execute, retries + DLQ,
-crash recovery + timeouts, cron schedules, metrics + packaging; last updated 2026-11-17).
+Status: **All phases (0-7) complete** (scaffold, submit API, claim + execute, retries + DLQ,
+crash recovery + timeouts, cron schedules, metrics + packaging, observability + admin UI;
+last updated 2026-11-18).
 
 Pinned versions: Java 21, Spring Boot 4.1.2, PostgreSQL 16 (`postgres:16-alpine` in both
 `compose.yaml` and the Testcontainers config, so tests run against what Compose runs).
@@ -449,9 +450,15 @@ GET    /api/v1/dlq
 POST   /api/v1/dlq/{id}/requeue
 POST   /api/v1/schedules            also GET (up to 500, by name), GET /{id}, DELETE /{id}; 409 on duplicate name
 POST   /api/v1/schedules/{id}/pause | /resume
-GET    /api/v1/workers?status=      200 most recently started, with `runningJobs` per worker
+GET    /api/v1/workers?status=      200 most recently started, with `runningJobs` and `heartbeatAgeSeconds`
+GET    /api/v1/stats                active-state counts, oldest-ready age, workers alive, heartbeat timeout
 GET    /actuator/prometheus | /actuator/health
+GET    /                            admin UI (§10), API processes only
 ```
+
+Job responses include `lockedBy` / `lockedAt` (the worker holding a RUNNING job and when it
+claimed it; null otherwise). `heartbeatAgeSeconds` is `now() - last_heartbeat_at` computed in
+SQL, so clients never subtract a database timestamp from their own clock.
 
 **Idempotent submit**: `INSERT ... ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING *`;
 on no row returned, select and return the existing job. If the replay's body differs
@@ -484,6 +491,13 @@ Micrometer's, Prometheus renders `jobs.submitted` as `jobs_submitted_total` and 
 - Gauges: `jobs.queue.depth{state=ready|scheduled|running|dead}`,
   `jobs.oldest.pending.age` (seconds, oldest *ready* job), `workers.alive`,
   `jobs.handlers.stuck`.
+- Every series carries a `host` tag (`management.metrics.tags.host`, from `$HOSTNAME`). In
+  Docker that is the container id, which is also the hostname a worker registers, so a
+  Grafana series, an admin-UI row and a `docker kill` target all use the same name.
+- `job.queue.wait` and `job.execution.duration` publish **histogram buckets** (range up to
+  10 minutes), not client-side percentiles. Percentiles computed per process cannot be
+  combined across workers; bucket counts can be summed and then fed to
+  `histogram_quantile`.
 
 Notes:
 - A counter moves only when its guarded `UPDATE` matched a row, so a result discarded by
@@ -497,7 +511,8 @@ Notes:
   fails, the previous values are reported rather than failing the scrape.
 - Counters and timers are per process (the API counts submissions, each worker its own
   executions); gauges are read from the database and agree across instances.
-  Aggregation is left to Prometheus, which the Compose stack does not include.
+  Aggregation is left to Prometheus (§10). Because every process reports the same gauge
+  values, dashboards aggregate gauges with `max()`, never `sum()`.
 
 Queue wait time and oldest-pending age are the metrics that matter operationally: they
 say whether the fleet is keeping up, which raw counts do not.
@@ -508,7 +523,56 @@ workers from that image, with heartbeat timings shortened (2s / 10s / 3s) so a k
 worker is detected in seconds. The `demo.*` handlers (`scheduler.demo-handlers.enabled`)
 exist for the README demos, the smoke test and the benchmark.
 
-## 10. Build plan
+## 10. Observability stack and admin UI
+
+### Prometheus and Grafana
+Compose adds `prometheus` (port 9090) and `grafana` (port 3000); configuration lives in
+`observability/`.
+
+- **Discovery**: the API is a static target; workers are found with `dns_sd_configs` on
+  the Compose service name `worker`, which resolves to one A record per running replica.
+  Scaling needs no config change, and a killed container leaves the target list on the
+  next refresh (5s). Scrape interval 5s.
+- **Grafana** is provisioned from files: the Prometheus datasource (fixed uid) and one
+  dashboard, `task-scheduler`, which is also the home dashboard. Panels: workers alive,
+  worker targets up, ready jobs, DLQ size, oldest ready age, throughput; queue depth by
+  state; succeeded/failed/timed-out/submitted rates; succeeded per worker (`host`);
+  retried / dead-lettered / reclaimed / released rates; queue-wait p50/p95/p99; workers
+  alive vs. targets up vs. stuck handlers.
+- **Anonymous Viewer access** is enabled so the demo needs no login. Acceptable only
+  because the stack is meant to run on a developer machine; it is not a deployment config.
+- After a `docker kill`, "targets up" drops within seconds while "workers alive" drops
+  only after the heartbeat timeout. The gap between the two lines is the detection delay
+  that crash recovery pays, and the dashboard shows it on one panel.
+
+### Admin UI
+Three static files (`index.html`, `app.css`, `app.js`) in `src/main/resources/admin-ui/`,
+served at `/ui/**` with `/` forwarding to the page, by an `AdminUiConfiguration` that only
+API processes register. The files are outside Spring Boot's default static locations, so
+a worker-only process serves nothing but actuator.
+
+- **No framework, no build step, no CDN.** It uses only the public REST API; anything the
+  UI can do, `curl` can do.
+- **Polling every 2s, not SSE.** The database is the source of truth, so an SSE endpoint
+  would itself have to poll the database to detect changes, and would add long-lived
+  connections and per-connection state to the API. Polling keeps the API stateless and
+  works unchanged behind several API instances. Polls never overlap, stop while the tab
+  is hidden and resume immediately when it is shown.
+- **Tabs**: jobs (status / type filter, latest 50, click or `#jobs/<id>` for attempt
+  history, cancel), workers (status, heartbeat age coloured against the timeout, running
+  jobs), DLQ (requeue), schedules (pause / resume / delete, create form), submit (demo job
+  types, batches of up to 500 with at most 8 requests in flight).
+- **Everything from the API is inserted with `textContent`**, never `innerHTML`, so job
+  payloads and error messages cannot inject markup. A `Content-Security-Policy` meta tag
+  allows only same-origin scripts and styles, and there is no inline script.
+- **`/api/v1/stats`** exists for the header tiles. It runs the same single query as the
+  queue gauges but uncached (the gauges' 5s cache would make a 2s poll show stale values),
+  and reports only active states: counting SUCCEEDED or CANCELLED would scan the entire
+  history, since those states have no partial index.
+- No authentication, like the rest of the API (non-goal). The UI can cancel, requeue and
+  delete, so the API must not be exposed beyond a trusted network.
+
+## 11. Build plan
 
 Each phase ends with passing tests and a DESIGN.md update. See the conversation for
 approval status.
@@ -522,8 +586,9 @@ approval status.
 | 4 | Heartbeat + reclaim + timeout | heartbeat thread, reaper, self-fencing, graceful shutdown, per-job execution timeout | kill a worker mid-job, another worker completes it; concurrent reapers reclaim once; zombie worker's late ack ignored; poison job ends in DLQ; shutdown release excuses the attempt and the re-claim gets a new attempt number; hung handler is interrupted, recorded TIMED_OUT, retried, and dies after budget; interrupt-ignoring handler's late ack rejected |
 | 5 | Cron | `schedules` table, firing loop, CRUD, pause/resume | 4 firers, one job per tick; misfire fires once; pause stops firing; timezone handling; invalid cron rejected |
 | 6 | Metrics + packaging | Micrometer metrics, Dockerfile, Compose with scaled workers, README with a crash-recovery demo and a throughput number | metrics reflect a known workload (counters, timers, gauges, Prometheus scrape); `scripts/smoke-test.sh` against real containers: 200 jobs over 3 workers with one attempt each, flaky job retried to success, `docker kill` recovery, `docker stop` release; draining worker is not reaped |
+| 7 | Observability + admin UI | Prometheus + Grafana in Compose with a provisioned dashboard; admin UI at `/`; `GET /api/v1/stats`, `heartbeatAgeSeconds`, `lockedBy` | stats counts active states only and is uncached; heartbeat age from the database clock; `lockedBy` set while RUNNING and cleared after; UI served by API processes only; histogram buckets published; smoke test: 4 Prometheus targets up, dashboard provisioned and returning data |
 
-## 11. Known limitations
+## 12. Known limitations
 
 - **Priority starvation.** The claim query orders strictly by `priority DESC`. If
   higher-priority jobs arrive at least as fast as the fleet can process them, a
@@ -539,16 +604,16 @@ approval status.
 - **At-least-once only** (§1).
 - **Finished jobs are never deleted**, so `jobs` and `job_attempts` grow without bound.
 
-## 12. Future work (deliberately out of scope)
+## 13. Future work (deliberately out of scope)
 
-- Priority aging (see §11)
+- Priority aging (see §12)
 - `LISTEN/NOTIFY` to cut polling latency
 - Retention: partition or archive finished jobs
 - Named queues with per-queue concurrency limits; rate limiting
 - "No overlap" policy for schedules
 - Auth on the API
 
-## 13. Decision log
+## 14. Decision log
 
 | Date | Decision | Reason |
 |---|---|---|
@@ -578,6 +643,13 @@ approval status.
 | 2026-11-17 | Queue gauges from one cached query over active states only | A scrape costs at most one query, served by partial indexes (§9) |
 | 2026-11-17 | Metrics are per process; no Prometheus in Compose | Aggregation belongs to the scraper; keeps the stack to one dependency (§9) |
 | 2026-11-17 | Throughput claim replaced by a measurement | ~11,500 no-op jobs/s, 3 workers, one laptop; reproducible with `scripts/benchmark.sh` (§1) |
+| 2026-11-18 | Admin UI polls every 2s instead of using SSE | SSE would have to poll the database anyway; polling keeps the API stateless and works across API instances (§10) |
+| 2026-11-18 | Admin UI is static files with no framework or build step, served only by API processes | Keeps the project about the scheduler; nothing to install; worker processes expose no UI (§10) |
+| 2026-11-18 | `/api/v1/stats` reports active states only, uncached | Finished states would need a full scan; the gauges' cache is too coarse for a 2s poll (§10) |
+| 2026-11-18 | Heartbeat age computed in SQL and returned by the API | Clients must not compare database timestamps with their own clocks (§9) |
+| 2026-11-18 | Latency timers publish histogram buckets; dashboards use `max()` for gauges | Buckets aggregate across workers, percentiles do not; every process reports identical gauges (§9) |
+| 2026-11-18 | Workers discovered by Prometheus via Compose DNS | Scaling needs no config change; killed containers drop out on their own (§10) |
+| 2026-11-18 | Grafana allows anonymous read-only access | Local demo stack only; noted as not a deployment configuration (§10) |
 | 2026-11-16 | `attempts` is monotonic; budget = `attempts - attempts_excused` | Release and requeue must not reuse an attempt number: it is the `job_attempts` key and the fencing token (§3) |
 | 2026-11-16 | Per-job execution timeout, enforced by the owning worker (Phase 4) | Worker heartbeats cannot see one hung handler; only the owner can interrupt it (§7) |
-| 2026-11-16 | Strict priority, starvation accepted and documented | Aging needs a stored effective priority to keep the claim index usable; deferred (§11) |
+| 2026-11-16 | Strict priority, starvation accepted and documented | Aging needs a stored effective priority to keep the claim index usable; deferred (§12) |

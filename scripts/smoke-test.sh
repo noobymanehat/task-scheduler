@@ -31,12 +31,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
-step "Starting postgres, 1 api, 3 workers"
+step "Starting postgres, 1 api, 3 workers, prometheus, grafana"
 docker compose up -d --build --quiet-pull
 wait_for 120 "API health" curl -fsS "$API/actuator/health"
 alive() { [[ "$(sql "SELECT count(*) FROM workers WHERE status = 'ALIVE'")" == "$1" ]]; }
 wait_for 120 "3 workers registered" alive 3
 echo "API is up; 3 workers alive"
+
+step "Admin UI, Prometheus and Grafana"
+curl -fsS "$API/" | grep -q "<title>Task Scheduler Admin</title>" || fail "admin UI not served at /"
+curl -fsS "$API/api/v1/stats" | grep -q '"workersAlive":3' || fail "stats endpoint does not report 3 live workers"
+targets_up() { [[ "$(curl -fsS localhost:9090/api/v1/targets?state=active | grep -o '"health":"up"' | wc -l | tr -d ' ')" == 4 ]]; }
+wait_for 60 "Prometheus to scrape the api and 3 workers" targets_up
+echo "Prometheus: 4 targets up (api + 3 workers found by DNS)"
+dashboard() { curl -fsS localhost:3000/api/dashboards/uid/task-scheduler | grep -q '"title":"Task Scheduler"'; }
+wait_for 60 "Grafana to serve the provisioned dashboard anonymously" dashboard
+# The dashboard's queries must return data, not just exist: ask Grafana's datasource proxy.
+queue_series() {
+  curl -fsS -G localhost:3000/api/datasources/proxy/uid/prometheus/api/v1/query \
+    --data-urlencode 'query=max by (state) (jobs_queue_depth)' | grep -q '"state":"ready"'
+}
+wait_for 60 "Grafana to read queue depth through Prometheus" queue_series
+echo "Grafana: dashboard provisioned, Prometheus datasource returns data"
 
 step "Submitting $BATCH demo.noop jobs over HTTP"
 for i in $(seq 1 "$BATCH"); do

@@ -4,6 +4,10 @@ import java.time.Instant;
 import java.util.UUID;
 import tools.jackson.databind.JsonNode;
 
+/**
+ * A job as the API returns it. {@code lockedBy} / {@code lockedAt} name the worker holding a
+ * RUNNING job and when it claimed it; once the job leaves RUNNING they are null.
+ */
 public record JobResponse(
         UUID id,
         String type,
@@ -17,6 +21,8 @@ public record JobResponse(
         int timeoutSeconds,
         String idempotencyKey,
         String lastError,
+        UUID lockedBy,
+        Instant lockedAt,
         UUID scheduleId,
         Instant createdAt,
         Instant updatedAt,
@@ -36,6 +42,8 @@ public record JobResponse(
                 job.timeoutSeconds(),
                 job.idempotencyKey(),
                 job.lastError(),
+                job.lockedBy(),
+                job.lockedAt(),
                 job.scheduleId(),
                 job.createdAt(),
                 job.updatedAt(),

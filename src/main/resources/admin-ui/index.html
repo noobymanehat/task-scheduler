@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Everything is same-origin and nothing is inline, so the policy can be strict. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'">
+  <title>Task Scheduler Admin</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232f6fdb'/%3E%3Cpath d='M4 8h8M8 4v8' stroke='white' stroke-width='2'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/ui/app.css">
+  <script src="/ui/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <h1>Task Scheduler</h1>
+    <span id="live" class="live" title="Refreshes every 2 seconds while this tab is visible">connecting…</span>
+  </div>
+  <div id="stats" class="stats" aria-live="polite">
+    <div class="stat"><span class="label">Ready</span><span class="value" data-stat="ready">–</span></div>
+    <div class="stat"><span class="label">Scheduled</span><span class="value" data-stat="scheduled">–</span></div>
+    <div class="stat"><span class="label">Running</span><span class="value" data-stat="running">–</span></div>
+    <div class="stat"><span class="label">Dead</span><span class="value" data-stat="dead">–</span></div>
+    <div class="stat"><span class="label">Oldest ready</span><span class="value" data-stat="oldestReadySeconds">–</span></div>
+    <div class="stat"><span class="label">Workers alive</span><span class="value" data-stat="workersAlive">–</span></div>
+  </div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <a href="#jobs" data-tab="jobs">Jobs</a>
+  <a href="#workers" data-tab="workers">Workers</a>
+  <a href="#dlq" data-tab="dlq">Dead letters</a>
+  <a href="#schedules" data-tab="schedules">Schedules</a>
+  <a href="#submit" data-tab="submit">Submit</a>
+</nav>
+
+<div id="toast" class="toast" role="status" hidden></div>
+
+<main>
+  <section id="tab-jobs" class="tab" hidden>
+    <div class="toolbar">
+      <label>Status
+        <select id="job-status">
+          <option value="">All</option>
+          <option>PENDING</option>
+          <option>RUNNING</option>
+          <option>SUCCEEDED</option>
+          <option>DEAD</option>
+          <option>CANCELLED</option>
+        </select>
+      </label>
+      <label>Type <input id="job-type" placeholder="any" size="14"></label>
+      <span class="hint">Latest 50, newest first. Click a row for its attempt history.</span>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Job</th><th>Type</th><th>Status</th><th>Attempts</th><th>Held by</th><th>Run at</th><th>Updated</th><th></th></tr></thead>
+        <tbody id="jobs-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-workers" class="tab" hidden>
+    <div class="toolbar">
+      <label><input type="checkbox" id="workers-alive-only"> Alive only</label>
+      <span class="hint" id="workers-hint"></span>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Hostname</th><th>Worker</th><th>Status</th><th>Heartbeat age</th><th>Running jobs</th><th>Started</th></tr></thead>
+        <tbody id="workers-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-dlq" class="tab" hidden>
+    <div class="toolbar"><span class="hint">Jobs that used up their retries, most recently dead first. Requeue grants a fresh retry budget.</span></div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Job</th><th>Type</th><th>Attempts</th><th>Last error</th><th>Died</th><th></th></tr></thead>
+        <tbody id="dlq-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-schedules" class="tab" hidden>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Name</th><th>Cron</th><th>Timezone</th><th>Job type</th><th>State</th><th>Next fire</th><th>Last fired</th><th></th></tr></thead>
+        <tbody id="schedules-body"></tbody>
+      </table>
+    </div>
+    <form id="schedule-form" class="card">
+      <h2>New schedule</h2>
+      <div class="grid">
+        <label>Name <input name="name" required placeholder="nightly-report"></label>
+        <label>Cron (6 fields, seconds first) <input name="cron" required value="*/10 * * * * *"></label>
+        <label>Timezone <input name="timezone" value="UTC"></label>
+        <label>Job type <input name="jobType" required value="demo.noop" list="demo-types"></label>
+        <label>Priority <input name="priority" type="number" value="0"></label>
+        <label>Max retries <input name="maxRetries" type="number" value="3" min="0" max="25"></label>
+      </div>
+      <label>Payload (JSON) <textarea name="payload" rows="2">{}</textarea></label>
+      <button type="submit">Create schedule</button>
+    </form>
+  </section>
+
+  <section id="tab-submit" class="tab" hidden>
+    <form id="submit-form" class="card">
+      <h2>Submit jobs</h2>
+      <div class="grid">
+        <label>Type <input name="type" required value="demo.sleep" list="demo-types"></label>
+        <label>How many <input name="count" type="number" value="1" min="1" max="500"></label>
+        <label>Priority <input name="priority" type="number" value="0"></label>
+        <label>Max retries <input name="maxRetries" type="number" value="3" min="0" max="25"></label>
+        <label>Timeout (s) <input name="timeoutSeconds" type="number" value="300" min="1"></label>
+        <label>Idempotency key <input name="idempotencyKey" placeholder="only when submitting 1"></label>
+      </div>
+      <label>Payload (JSON) <textarea name="payload" rows="2">{"millis": 20000}</textarea></label>
+      <p class="hint" id="type-help"></p>
+      <button type="submit">Submit</button>
+    </form>
+  </section>
+</main>
+
+<datalist id="demo-types">
+  <option value="demo.noop">
+  <option value="demo.sleep">
+  <option value="demo.flaky">
+</datalist>
+</body>
+</html>

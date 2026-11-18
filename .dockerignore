@@ -4,3 +4,5 @@ target
 .vscode
 *.md
 scripts
+docs
+observability

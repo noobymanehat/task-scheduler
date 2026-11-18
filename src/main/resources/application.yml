@@ -18,6 +18,20 @@ management:
     web:
       exposure:
         include: health,prometheus
+  metrics:
+    tags:
+      # Docker sets HOSTNAME to the container id, which is also what workers register as their
+      # hostname, so Grafana's per-worker series line up with the admin UI and `docker kill`.
+      host: ${HOSTNAME:local}
+    distribution:
+      # Publish histogram buckets, not just client-side percentiles: percentiles cannot be
+      # combined across workers, buckets can (Grafana uses histogram_quantile over their sum).
+      percentiles-histogram:
+        "[job.queue.wait]": true
+        "[job.execution.duration]": true
+      maximum-expected-value:
+        "[job.queue.wait]": 10m
+        "[job.execution.duration]": 10m
 
 scheduler:
   api:

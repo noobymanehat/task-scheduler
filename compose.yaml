@@ -1,4 +1,9 @@
-# The full stack: Postgres, one API instance, and a pool of workers from the same image.
+# The full stack: Postgres, one API instance, a pool of workers from the same image, and
+# Prometheus + Grafana scraping all of them.
+#
+#   Admin UI    http://localhost:8080
+#   Grafana     http://localhost:3000   (anonymous read-only access; local use only)
+#   Prometheus  http://localhost:9090
 #
 #   docker compose up --build              # 3 workers
 #   docker compose up --build --scale worker=5
@@ -16,6 +21,10 @@ x-app: &app
     DB_URL: jdbc:postgresql://postgres:5432/scheduler
     DB_USER: scheduler
     DB_PASSWORD: scheduler
+    # Fleet-wide heartbeat settings. The API reads the timeout too, to report it to the UI.
+    SCHEDULER_WORKER_HEARTBEAT_INTERVAL: 2s
+    SCHEDULER_WORKER_HEARTBEAT_TIMEOUT: 10s
+    SCHEDULER_WORKER_REAPER_INTERVAL: 3s
 
 services:
   postgres:
@@ -50,13 +59,41 @@ services:
       SCHEDULER_API_ENABLED: "false"
       SCHEDULER_WORKER_ENABLED: "true"
       SCHEDULER_WORKER_CONCURRENCY: "10"
-      SCHEDULER_WORKER_HEARTBEAT_INTERVAL: 2s
-      SCHEDULER_WORKER_HEARTBEAT_TIMEOUT: 10s
-      SCHEDULER_WORKER_REAPER_INTERVAL: 3s
     deploy:
       replicas: 3
     # Longer than scheduler.worker.shutdown-grace (30s), so in-flight jobs can drain or be released.
     stop_grace_period: 40s
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    environment:
+      # Anonymous, read-only access so the demo needs no login. Fine for a stack that only
+      # runs on a laptop; never expose this configuration on a network.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/task-scheduler.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
 
 volumes:
   pgdata:

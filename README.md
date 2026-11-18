@@ -11,7 +11,9 @@ jobs over REST; any number of identical workers claim and run them.
 - **Graceful shutdown**: a stopping worker drains, then hands unfinished jobs back without
   spending their retry budget.
 - **Cron schedules** that fire exactly one job per tick, however many instances are running.
-- **Per-job timeouts**, priorities, delayed jobs, idempotency keys, Prometheus metrics.
+- **Per-job timeouts**, priorities, delayed jobs, idempotency keys.
+- **Observability**: Prometheus metrics, a provisioned Grafana dashboard, and a small admin UI
+  for watching jobs and workers live.
 
 The delivery guarantee is **at-least-once**: a job can run more than once (a worker may crash
 after doing the work but before recording it), so handlers must be idempotent.
@@ -24,8 +26,19 @@ hot path, and why each decision was made.
 Requires Docker.
 
 ```bash
-docker compose up --build        # postgres + 1 api + 3 workers
+docker compose up --build        # postgres + 1 api + 3 workers + prometheus + grafana
 ```
+
+| | URL |
+|---|---|
+| Admin UI | <http://localhost:8080> |
+| Grafana dashboard | <http://localhost:3000> (no login) |
+| Prometheus | <http://localhost:9090> |
+| REST API | `http://localhost:8080/api/v1/...` |
+
+Grafana allows anonymous read-only access so the demo needs no login. That is fine for a stack
+running on your own machine and is not a configuration to expose on a network. The same goes
+for the admin UI and API, which have no authentication at all.
 
 Submit a job:
 
@@ -62,7 +75,52 @@ Three demo job types are built in:
 | `demo.sleep` | Sleeps for payload `millis` (default 1000) |
 | `demo.flaky` | Fails until the attempt number reaches payload `succeedOnAttempt`; without it, fails every time and ends in the DLQ |
 
-## Demo: kill a worker mid-job
+## Demo: watch a worker die
+
+Open the admin UI at <http://localhost:8080> and Grafana at <http://localhost:3000> side by
+side.
+
+1. In the UI's **Submit** tab, submit 3 `demo.sleep` jobs with payload `{"millis": 45000}`.
+   You land on the **Jobs** tab. Click one of the running jobs: **Held by** shows the
+   container holding it, for example `d52ff0a6ee6d`.
+2. Kill that container. `SIGKILL` gives it no chance to clean up or release anything:
+
+   ```bash
+   docker kill d52ff0a6ee6d
+   ```
+
+3. On the **Workers** tab the killed worker still says `ALIVE`. It is only *believed*
+   alive until its heartbeat is too old. Its heartbeat age climbs and turns amber; the other
+   workers keep refreshing every 2 s:
+
+   ![Workers tab: the killed worker's heartbeat age is 8.3 s and rising](docs/screenshots/workers-heartbeat-late.png)
+
+4. About 10 s after the kill (the heartbeat timeout in `compose.yaml`), a reaper on one of
+   the surviving workers declares it `DEAD` and puts its running jobs back in the queue:
+
+   ![Workers tab: the killed worker is DEAD with 0 running jobs](docs/screenshots/workers-dead.png)
+
+5. Back on **Jobs**, the job you opened (also reachable at `/#jobs/<id>`) shows its attempt
+   history: attempt 1 `ABANDONED` on the dead container, attempt 2 already `RUNNING` on
+   another worker. The abandoned attempt counts against the retry budget (`2 / max 4`), so a
+   job that crashes every worker it touches ends in the DLQ instead of looping forever:
+
+   ![Job history: attempt 1 abandoned on the killed worker, attempt 2 running elsewhere](docs/screenshots/job-reclaimed.png)
+
+6. In Grafana, the killed container's line in **Succeeded per worker** stops. In **Workers**,
+   "scrape targets up" drops within seconds (Prometheus loses the container), but
+   "alive (heartbeat)" drops only about 10 s later: the gap is the detection delay that crash
+   recovery pays. A blip in **reclaimed from dead worker** follows.
+
+   ![Grafana dashboard during the demo](docs/screenshots/grafana.png)
+
+   This screenshot was taken while a script submitted about 20 jobs/s. The spike in ready
+   jobs and queue wait near 23:37:30 is all workers being recreated at once by a rebuild;
+   the kill is at 23:40:13.
+
+Use `docker compose up -d` afterwards to bring the killed worker back.
+
+## Demo: kill a worker mid-job, from the command line
 
 Start a 20-second job and find the container running it (a worker's hostname is its
 container id):
@@ -90,7 +148,8 @@ becomes 1, and the worker ends as `STOPPED` rather than `DEAD`.
 
 `scripts/smoke-test.sh` runs all of this unattended and checks the results: 200 jobs across
 3 workers with exactly one attempt each, a flaky job that succeeds on its third attempt,
-`docker kill` recovery, `docker stop` release, and the metrics endpoint.
+`docker kill` recovery, `docker stop` release, the metrics endpoint, the admin UI, and
+Prometheus and Grafana (4 targets up, dashboard provisioned and returning data).
 
 ## More of the API
 
@@ -144,10 +203,37 @@ curl -s localhost:8080/actuator/prometheus | grep -E '^(jobs|workers)_'
 | `schedules_fired_total` | Jobs created by cron schedules |
 | `jobs_handlers_stuck` | Timed-out handlers that ignored interruption and still hold a slot |
 
+Every series has a `host` tag: the container id, which is also the hostname the admin UI
+shows for a worker.
+
 Counters and timers are per process: the API reports submissions, each worker reports its own
-claims and executions. The queue gauges come from the database, so any instance reports the
-same values. Only the API's port is published by `compose.yaml`, and the stack does not
-include a Prometheus server; workers listen on 8080 inside the Compose network.
+claims and executions. Prometheus scrapes the API and every worker (found through Compose's
+DNS, so `--scale worker=5` needs no config change) and the Grafana dashboard sums them. The
+queue gauges come from the database, so every instance reports the same values; the
+dashboard takes `max()` of them rather than summing. The latency timers publish histogram
+buckets, so percentiles in Grafana are computed across all workers.
+
+The dashboard (`observability/grafana/dashboards/task-scheduler.json`) shows: workers alive
+vs. scrape targets up, queue depth by state, oldest ready job, throughput, succeeded per
+worker, retries / dead letters / reclaims / releases, and queue wait p50 / p95 / p99.
+
+## Admin UI
+
+Served by the API at `/`; three static files with no framework, build step or external
+requests (`src/main/resources/admin-ui/`). It polls the REST API every 2 seconds while the
+tab is visible.
+
+- **Jobs**: latest 50 with status and type filters; click a row (or open `/#jobs/<id>`) for
+  the payload, last error and every attempt with its worker and outcome; cancel pending jobs.
+- **Workers**: status, heartbeat age (amber past a third of the timeout, red past it),
+  running jobs.
+- **Dead letters**: last error per job, with requeue.
+- **Schedules**: pause, resume, delete, and a form to create one.
+- **Submit**: any job type with a payload, up to 500 at once.
+
+The header tiles come from `GET /api/v1/stats` (counts of active job states, oldest ready
+age, workers alive). Worker responses include `heartbeatAgeSeconds`, and job responses
+include `lockedBy`, the worker holding a running job.
 
 ## Throughput
 
@@ -227,6 +313,7 @@ Requires JDK 21 and a running Docker daemon (tests use Testcontainers with a rea
 scripts/smoke-test.sh                  # end-to-end against the Compose stack
 
 docker compose up postgres             # database only, then run the app from an IDE
+                                       # (admin UI then at http://localhost:8080)
 docker compose up --build --scale worker=5
 ```
 
@@ -246,4 +333,4 @@ Micrometer, JUnit 5, Testcontainers, Awaitility.
 - Finished jobs are never deleted.
 - No authentication.
 
-Details and intended fixes are in [DESIGN.md §11-12](DESIGN.md#11-known-limitations).
+Details and intended fixes are in [DESIGN.md §12-13](DESIGN.md#12-known-limitations).
